@@ -19,6 +19,7 @@ var received : bool
 
 # RF: additional instrumented bit for representing F(sending)
 var f_sending : bool 
+var f_received : bool 
 
 after init {
     trying := false;
@@ -68,7 +69,7 @@ invariant ~receiving
 
 #explicit temporal axiom [strongfair] (globally eventually sending) -> (globally eventually receiving)
 # RF: now we replace this axiom.
-explicit temporal axiom [strongfair0] ~f_sending -> globally ~sending 
+#explicit temporal axiom [strongfair0] ~f_sending -> globally ~sending 
 #explicit temporal axiom [strongfair1] eventually ~f_sending 
 # Safety property: if the sender infinitely often calls try_send, the message is
 # eventially received. We write 'eventually received' in a funny way: 
@@ -77,6 +78,7 @@ explicit temporal axiom [strongfair0] ~f_sending -> globally ~sending
 #
 # This is because the ranking tactic expects a formula in this form.
 #
+
 
 temporal property [live] (globally eventually trying) -> (globally ~received -> eventually received)
 
