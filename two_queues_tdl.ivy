@@ -1,0 +1,94 @@
+#lang ivy1.8
+include order
+
+instance lclock : unbounded_sequence
+
+module simple_queue(nat) with nat = {
+
+    var begun1(X:nat) : bool 
+    var begun2(X:nat) : bool
+    var done1(X:nat) : bool
+    var done2(X:nat) : bool 
+
+    var trying1 : bool 
+    var trying2 : bool  
+
+    after init {
+        begun1(X) := false;
+        done1(X) := false;
+        begun2(X) := false;
+        done2(X) := false;
+        trying1 := false;
+        trying2 := false;
+    }
+
+
+    action send1(lt:nat) = {
+        begun1(lt) := true;
+    }
+
+    before send1(lt:nat) {
+        require begun1(X) -> X < lt;
+    }
+
+    action recv1 = {
+        trying1 := true;
+        trying1 := false;
+        if some x:nat. begun1(x) & ~done1(x) minimizing x {
+                done1(x) := true;
+                begun2(x) := true;
+        }
+    }
+
+    action recv2 = {
+        trying2 := true;
+        trying2 := false;
+        if some x:nat. begun2(x) & ~done2(x) minimizing x {
+            done2(x) := true;
+        }
+    }
+
+    invariant [t1] ~trying1 
+    invariant [t2] ~trying2 
+
+    invariant [inv1] begun2(X) -> done1(X) 
+    invariant [inv2] done1(X) -> begun1(X)
+    invariant [inv3] done1(X) -> begun2(X) 
+
+    function pending1(X) = begun1(X) & ~done1(X)
+    function pending2(X) = begun2(X) & ~done2(X)
+} 
+
+instance m : simple_queue(lclock)
+
+export m.send1
+export m.recv1
+export m.recv2
+
+isolate proofs = {
+    explicit temporal property [lemma1]
+        ((globally eventually m.trying1) & (globally eventually m.trying2)) ->
+        forall X. (globally m.begun1(X) -> eventually m.done2(X))
+        proof {
+            tactic skolemizenp
+            tactic ranking_infer_tdl with {
+                definition work_created[1](X) = m.begun1(X) | m.begun2(X)
+                definition work_needed[1](X) = X <= _X & m.begun1(X) & ~m.done1(X)
+                definition work_invar[1] = m.begun1(_X) | m.begun2(_X)
+                definition work_progress[1] = m.trying1
+                definition work_helpful[1] = m.begun1(_X) & ~m.done1(_X)
+                definition work_init[1] = m.trying1
+                definition work_conclude[1] = true
+              
+                definition work_created[2](X) = m.begun1(X) | m.begun2(X)
+                definition work_needed[2](X) = X <= _X & (m.pending1(X) | m.pending2(X))
+                definition work_invar[2] = m.begun1(_X) | m.begun2(_X)
+                definition work_progress[2] = m.trying2
+                definition work_helpful[2] = m.begun2(_X) & ~m.done2(_X)
+                definition work_init[2] = m.trying2
+                definition work_conclude[2] = true
+            }
+        }
+
+} with this 
+
