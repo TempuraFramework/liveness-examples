@@ -1,0 +1,152 @@
+#lang ivy 1.7
+
+################################################################################
+# Types and Orders
+################################################################################
+
+type thread
+type ticket
+
+relation (X:thread < Y:thread)
+axiom (X:thread < Y & Y < Z) -> X < Z
+axiom ~(X:thread < Y & Y < X)
+axiom X:thread < Y | Y < X | X = Y
+
+relation (X:ticket < Y:ticket)
+axiom (X:ticket < Y & Y < Z) -> X < Z
+axiom ~(X:ticket < Y & Y < X)
+axiom X:ticket < Y | Y < X | X = Y
+
+individual zero : ticket
+axiom forall X. ~ (X < zero)
+
+################################################################################
+# State
+################################################################################
+
+type location = {idle, picking, waiting, critical}
+
+individual pc(T:thread) : location
+individual number(T:thread) : ticket
+relation choosing(T:thread)
+# fairness signals
+relation start_picking_fair(T:thread)
+relation finish_picking_fair(T:thread)
+relation enter_fair(T:thread)
+relation leave_fair(T:thread)
+
+################################################################################
+# Initial State
+################################################################################
+
+after init {
+    pc(T) := idle;
+    number(T) := zero;
+    choosing(T) := false;
+
+    start_picking_fair(T):=false;
+    finish_picking_fair(T):=false;
+    enter_fair(T):=false;
+    leave_fair(T):=false;
+}
+
+################################################################################
+# Actions
+# Note: For liveness, we use 'require' for guards instead of 'if'.
+# This allows Ivy to detect when an action is 'enabled' vs 'disabled'.
+################################################################################
+
+
+
+action start_picking(t:thread) = {
+    start_picking_fair(t) := true;
+    start_picking_fair(t) := false;
+    
+    if pc(t) = idle {
+      choosing(t) := true;
+      pc(t) := picking;
+    }
+}
+
+action finish_picking(t:thread) = {
+    finish_picking_fair(t) := true;
+    finish_picking_fair(t) := false;
+    if pc(t) = picking {
+      start(t) := true;
+      local n : ticket {
+        assume forall Other. number(Other) < n;
+        assume n ~= zero;
+        number(t) := n;
+        choosing(t) := false;
+        pc(t) := waiting;
+      }
+    }
+}
+
+action enter(t:thread) = {
+    enter_fair(t) := true;
+    enter_fair(t) := false;
+
+    if pc(t) = waiting {
+      if forall Other. (Other ~= t -> 
+        (~choosing(Other) & 
+            (number(Other) = zero | 
+             number(t) < number(Other) | 
+             (number(t) = number(Other) & t < Other))
+        )
+      ) {
+        pc(t) := critical;
+      }
+    }
+}
+
+action leave(t:thread) = {
+    leave_fair(t) := true;
+    leave_fair(t) := false;
+    if (pc(t) = critical) {
+      number(t) := zero;
+      pc(t) := idle;
+    }
+}
+
+################################################################################
+# Liveness Verification
+################################################################################
+
+# 1. Fairness Assumptions
+# We assume the scheduler is weakly fair: if an action is continuously enabled, 
+# it will eventually occur.
+#attribute [fairness] start_picking
+#attribute [fairness] finish_picking
+#attribute [fairness] enter
+#attribute [fairness] leave
+
+# 2. The Liveness Property
+# Syntax: globally (p -> eventually q)
+property [starvation_freedom] 
+    ((forall T. globally eventually start_picking_fair(T)) & 
+    (forall T. globally eventually finish_picking_fair(T)) & 
+    (forall T. globally eventually enter_fair(T)) & 
+    (forall T. globally eventually leave_fair(T))) ->
+    (
+    forall T. globally (pc(T) = waiting -> eventually pc(T) = critical)
+    )
+proof {
+  tactic skolemizenp;
+  tactic showgoals
+}
+################################################################################
+# Safety Invariants (Required for Liveness Proof)
+################################################################################
+
+invariant [mutex] (pc(T1) = critical & pc(T2) = critical) -> T1 = T2
+invariant [valid_ticket] (pc(T) = waiting | pc(T) = critical) -> number(T) > zero
+invariant [no_ticket_idle] (pc(T) = idle | pc(T) = picking) -> number(T) = zero
+invariant [choosing_pc] choosing(T) <-> pc(T) = picking
+invariant [ordering] (pc(T1) = critical & T1 ~= T2 & number(T2) ~= zero) -> 
+    (number(T1) < number(T2) | (number(T1) = number(T2) & T1 < T2))
+
+export start_picking
+export finish_picking
+export enter
+export leave
