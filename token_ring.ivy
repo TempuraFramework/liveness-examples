@@ -1,0 +1,22 @@
+#lang ivy1.8
+
+type proc
+
+# whether `proc` has entered the ring
+relation entered(T:proc)
+
+# whether `proc` holds the token in the ring
+relation at(T:proc)
+
+# transitive successor relation
+relation succ(T1:proc, T2:proc)
+
+# fairness conditions
+relation try_enter_ring(T:proc)
+relation try_enter_cs(T:proc)
+relation try_leave_cs(T:proc)
+
+after init {
+  entered
+}
+

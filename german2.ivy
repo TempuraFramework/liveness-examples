@@ -1,0 +1,243 @@
+#lang ivy1.8
+
+### German's Cache Coherence Protocol
+#
+# German's protocol is a directory-based cache-coherence protocol
+# where: an unbounded number of clients communicate with a central
+# `home` process to gain access to a memory address. Access can be
+# granted in three types: {invalid, shared, exclusive}. 
+#   `invalid` - Access to this address has been expired.
+#   `shared` - Access to this address is shared among many clients.
+#   `exclusive` - Access to this address is held exclusively by a client.
+# 
+# The `home` process maintains explicitly two lists of clients:
+#   - Those sharing the cache line, `sharerList`
+#   - Those for which the home has invalidated the cache line but 
+#     has not acknowledged the invalidation, `invalidateList`
+#
+# The clients send requests to the home process for access to memory
+# address. There are two types of requests:
+#   `req_shared` - request shared access to a memory address
+#   `req_exclusive` - request exclusive access to a memory address
+# The `home` process in turn acknowledges the requests using two types
+# of messages:
+#   `grant_shared` - granting shared access to an address for a client
+#   `grant_exclusive` - granting exclusive access to an address for a client.
+#
+# In addition, `home` process can invalidate cache at clients:
+#   `invalidate` - sent by home to a client to invalidate the client's access.
+#   `invalidate_ack` - reply sent by client to acknowledge invalidation.
+#
+# For a particular cache line (address), the home can only grant exclusive
+# access if the invariant (forall C. ~sharerList(C)). That is, no other
+# clients hold access to the cache line.
+#
+# The home maintains variables `current_client`, `current_request` to denote
+# the currently processed client and request.
+#
+# In this version of the protocol there are three FIFO channels
+#   - ch1 (client to home) - request to a home node
+#   - ch2 (home to client) - remote cache invalidation request, reply from the home node
+#   - ch3 (client to home) - invalidate acknowledgement
+# Each client communicates with the home process via these three channels.
+
+type client
+
+### State of the clients
+
+var reqShared(C:client) : bool          # whether client C requested shared access
+var reqExclusive(C:client) : bool       # whether client C requested exclusive access
+var invalidateAck(C:client) : bool      # whether client C has acknowledged invalidation request
+var cacheShared(C:client) : bool        # whether client C has shared access locally
+var cacheExclusive(C:client) : bool     # whether client C has exclusive access locally
+
+### State of the home directory
+
+var invalidate(C:client) : bool         # whether home has sent invalidation request has been sent to client C
+var grantShared(C:client) : bool        # whether home has granted shared access to client C
+var grantExclusive(C:client) : bool     # whether home has granted exclusive access to client C
+
+
+var homeSharerList(C:client) : bool     # list of 
+var homeInvalidateList(C:client) : bool
+var homeExclusiveGranted : bool
+var homeCurrentReqShared : bool
+var homeCurrentReqExclusive : bool
+var homeCurrentclient : client
+
+# `owner` denotes the home directory process.
+var owner : client
+
+after init {
+    reqShared(C:client) := false;
+    reqExclusive(C:client) := false;
+    invalidate(C:client) := false;
+    grantShared(C:client) := false;
+    grantExclusive(C:client) := false;
+    invalidateAck(C:client) := false;
+    cacheShared(C:client) := false;
+    cacheExclusive(C:client) := false;
+    homeSharerList(C:client) := false;
+    homeInvalidateList(C:client) := false;
+    homeExclusiveGranted := false;
+    homeCurrentReqShared := false;
+    homeCurrentReqExclusive := false;
+}
+
+# If client `cl` hasn't had any access, nor has `cl` requested any access, then `cl` can 
+# request shared access.
+
+action reqSharedRule(cl:client) = {
+    require (~cacheShared(cl) & ~cacheExclusive(cl)) & (~reqShared(cl) & ~reqExclusive(cl));
+    reqShared(cl) := true;
+}
+
+# If client `cl` hasn't had any access, nor has `cl` requested any access, then `cl` can
+# request exclusive access.
+
+action reqExclusiveRule(cl:client) = {
+    require (~cacheShared(cl) & ~cacheExclusive(cl)) & (~reqShared(cl) & ~reqExclusive(cl));
+    reqExclusive(cl) := true
+}
+
+# We do not serve a client in an atomic step. whether clients have been served
+# is modeled by the `homeCurrentReqShared` and `homeCurrentReqExclusive` pair of 
+# rules. When one of these two variables are toggled, it means that 
+# if client `cl` has requested shared access to the cache line, and the `home`
+# process is in reply mode.
+
+# The following action handles when the home directory is idle and wishes
+# to service a new client request for accessing cache in shared mode. After
+# executing the action, `homeCurrentclient` will be set to the client who
+# is being serviced, and `home` enters a mode in which we wait for `grantSharedRule`
+# action to execute.
+action pickNewSharedRequestRule(cl:client) = {
+    require (~homeCurrentReqShared & ~homeCurrentReqExclusive) & reqShared(cl);
+    homeCurrentReqShared := true;
+    reqShared(cl) := false;
+    homeCurrentclient := cl;
+    homeInvalidateList(C) := homeSharerList(C);
+}
+
+# The following action handles when the home directory is idle and wishes
+# to service a new client request for accessing cache in exclusive mode.
+action pickNewExclusiveRequestRule(cl:client) = {
+    require (~homeCurrentReqShared & ~homeCurrentReqExclusive) & reqExclusive(cl);
+    homeCurrentReqExclusive := true;
+    reqExclusive(cl) := false;
+    homeCurrentclient := cl;
+    homeInvalidateList(C) := homeSharerList(C);
+}
+
+# This action is entered in a state where `home` is servicing `homeCurrentclient`
+# who is requesting cache access in shared mode. After this
+action grantSharedRule = {
+    require
+        homeCurrentReqShared
+      & ~homeExclusiveGranted
+      & ~invalidate(homeCurrentclient)
+      & ~grantShared(homeCurrentclient)
+      & ~grantExclusive(homeCurrentclient);
+    homeSharerList(homeCurrentclient) := true;
+    homeCurrentReqShared := false;
+    grantShared(homeCurrentclient) := true;
+}
+
+action grantExclusiveRule = {
+    require
+        homeCurrentReqExclusive
+      & ~invalidate(homeCurrentclient)
+      & ~grantShared(homeCurrentclient)
+      & ~grantExclusive(homeCurrentclient)
+      & forall I. ~homeSharerList(I);
+    homeSharerList(homeCurrentclient) := true;
+    homeCurrentReqExclusive := false;
+    homeExclusiveGranted := true;
+    grantExclusive(homeCurrentclient) := true;
+    owner := homeCurrentclient; 
+}
+
+action sendInvalidateRule(cl:client) = {
+    require (~invalidate(cl) & ~grantShared(cl) & ~grantExclusive(cl)) & homeInvalidateList(cl)
+    & (homeCurrentReqExclusive | (homeCurrentReqShared & homeExclusiveGranted));
+    invalidate(cl) := true;
+    homeInvalidateList(cl) := false;
+}
+
+# When home sends back an invalidation acknowledgement 
+action receiveInvalidateAckRule(cl:client) = {
+    require (homeCurrentReqShared | homeCurrentReqExclusive) & invalidateAck(cl);
+    homeSharerList(cl) := false;
+    homeExclusiveGranted := false;
+    invalidateAck(cl) := false;
+}
+
+# When home sends an invalidation request, `cl` can
+# set its local status to having no access.
+action sharerInvalidatesCacheRule(cl:client) = {
+    require invalidate(cl) & ~invalidateAck(cl);
+    invalidate(cl) := false;
+    invalidateAck(cl) := true;
+    cacheShared(cl) := false;
+    cacheExclusive(cl) := false;
+}
+
+# When home acknowledges a shared request, `cl` can
+# set its local status to having shared access.
+action receiveSharedGrantRule(cl:client) = {
+    require grantShared(cl);
+    cacheShared(cl) := true;
+    grantShared(cl) := false;
+}
+
+# When home acknowledges an exclusive request, `cl` can
+# set its local status to having shared access.
+action receiveExclusiveGrantRule(cl:client) = {
+    require grantExclusive(cl);
+    cacheExclusive(cl) := true;
+    grantExclusive(cl) := false;
+}
+
+invariant ~ (C ~= D & cacheExclusive(C) & (cacheExclusive(D) | cacheShared(D)))
+
+# invariant forall C1. ~(reqShared(C1) & reqExclusive(C1))
+
+# invariant forall C1. ~(invalidate(C1) & grantShared(C1))
+
+# invariant forall C1. ~(invalidate(C1) & grantExclusive(C1))
+
+# invariant forall C1. ~(grantShared(C1) & grantExclusive(C1))
+
+# invariant forall C1. ~(cacheShared(C1) & cacheExclusive(C1))
+
+# invariant homeexclusiveGranted & (homeCurrentReqShared | homeCurrentReqExclusive) & invalidateAck(C1) -> C1 = owner
+
+# invariant (cacheShared(C) | grantShared(C)) -> homeSharerList(C) & ~homeExclusiveGranted
+
+# invariant (cache(C) = exclusive | channel2_4(C) = grantexclusive) -> homeSharerList(C) & homeexclusiveGranted & C = owner
+
+# invariant homeexclusiveGranted & homeSharerList(C) -> C = owner
+
+# invariant channel2_4(C) = invalidate ->  (homeCurrentCommand = reqexclusive
+#        | (homeCurrentCommand = reqshared & homeexclusiveGranted)) & homeSharerList(C) & ~homeinvalidateList(C)
+
+# invariant channel3(C) = invalidateAck -> cache(C) = invalid & (homeCurrentCommand = reqexclusive
+#        | (homeCurrentCommand = reqshared & homeexclusiveGranted)) & homeSharerList(C) & ~homeinvalidateList(C)
+
+# invariant channel2_4(C) ~= empty2_4 -> channel3(C) ~= invalidateAck
+
+# invariant  homeinvalidateList(C) -> homeSharerList(C)
+
+
+export reqSharedRule
+export reqExclusiveRule
+export pickNewSharedRequestRule
+export pickNewExclusiveRequestRule
+export grantExclusiveRule
+export grantSharedRule
+export receiveSharedGrantRule
+export receiveExclusiveGrantRule
+export sendInvalidateRule
+export sharerInvalidatesCacheRule
+export receiveInvalidateAckRule
+
