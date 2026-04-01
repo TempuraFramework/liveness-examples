@@ -58,8 +58,9 @@ module signal(data) = {
 
 isolate ticket_protocol = {
 
-    finite type thread
-    instance ticket : unbounded_sequence
+#finite type thread
+  type thread
+  instance ticket : unbounded_sequence
 
     action step12(t:thread)
     action step22(t:thread, k:ticket)
@@ -129,26 +130,31 @@ isolate ticket_protocol = {
 	################################################################################
 
 	# basic
-	invariant pc1(T) | pc2(T) | pc3(T)
-	invariant ~pc1(T) | ~pc2(T)
-	invariant ~pc1(T) | ~pc3(T)
-	invariant ~pc2(T) | ~pc3(T)
-	invariant m(T,K1) & m(T,K2) -> K1 = K2
+	invariant forall T. pc1(T) | pc2(T) | pc3(T)
+	invariant forall T. ~pc1(T) | ~pc2(T)
+	invariant forall T. ~pc1(T) | ~pc3(T)
+	invariant forall T. ~pc2(T) | ~pc3(T)
+	invariant forall T. forall K1. forall K2. m(T,K1) & m(T,K2) -> K1 = K2
 
 	# safety property
-	invariant pc3(T1) & pc3(T2) -> T1 = T2
+	invariant forall T1. forall T2. pc3(T1) & pc3(T2) -> T1 = T2
 
 	# inductive invariant for proving safety
-	invariant next_ticket = 0 -> m(T,0)
-	invariant next_ticket ~= 0 & m(T,M) -> next_ticket > M
-	invariant (pc2(T) | pc3(T)) -> next_ticket ~= 0
-	invariant m(T1,M) & m(T2,M) & M ~= 0 -> T1 = T2
-	invariant pc2(T) & m(T,M) -> service <= M
-	invariant pc3(T) -> m(T,service)
+	invariant forall T. next_ticket = 0 -> m(T,0)
+	invariant forall T. forall M. next_ticket ~= 0 & m(T,M) -> next_ticket > M
+	invariant forall T. (pc2(T) | pc3(T)) -> next_ticket ~= 0
+	invariant forall T1, T2. forall M. m(T1,M) & m(T2,M) & M ~= 0 -> T1 = T2
+	invariant forall T. forall M. pc2(T) & m(T,M) -> service <= M
+	invariant forall T. pc3(T) -> m(T,service)
 	invariant service <= next_ticket
-	invariant ~(~pc1(T1) & ~pc1(T2) & m(T1,0) & m(T2,0) & T1 ~= T2)
+	invariant forall T1, T2. ~(~pc1(T1) & ~pc1(T2) & m(T1,0) & m(T2,0) & T1 ~= T2)
 
 
+  invariant forall T. forall M. pc1(T) & m(T,M) & M ~= 0 -> service >  M
+  invariant forall K:ticket. K < next_ticket & service <= K -> exists T:thread. m(T,K) & ~pc1(T)
+
+
+  ################################################################################
 	#
 	# Temporal property and its proof
 	#
@@ -160,51 +166,20 @@ isolate ticket_protocol = {
         -> forall T,X. (globally pc2(T) & m(T,X) -> eventually pc3(T))
         proof {
             tactic skolemizenp;
-            tactic ranking_infer_tdl with {
-
-                # How to decode the following predicates:
-                # - work_created is R, the reached set, in the notes
-                # - work_needed is delta, the ranking
-                # - work_invar is phi, the liveness invariant
-                # - work_progress is r, the justice condition(s)
-                # - work_helpful is psi, the stable scheduler
-                #
-                # The number in square brackets are subscripts.
-                # Notice we actually have an R_i for each delta_i,
-                # rather that a single R to prove finiteness of all
-                # the delta_i. In this case R_i is the same for both
-                # rankings.
+            tactic ranking with {
 
                 definition work_created[0](X) = X <= next_ticket
-                definition work_needed[0](X) = service <= X & X <= _X & exists T. (m(T,X) & pc2(T))
-                # forall X. forall T.
-                #   service < X & X < _X & X < _X & ~m(T, X) & ~pc2(T) & (_X < next_ticket & pc2(_T) & m(_T, _X))
-                #   | service = X & X < _X & ~m(T, X) & ~pc2(T) & (_X < next_ticket & pc2(_T) & m(_T, _X))
-                #   | service < X & X = _X & ~m(T, X) & ~pc2(T) & (_X < next_ticket & pc2(_T) & m(_T, _X))
-                #   | service = X & X = _X & ~m(T, X) & ~pc2(T) & (_X < next_ticket & pc2(_T) & m(_T, _X))
+                definition work_needed[0](X) = service <= X & X <= _X & exists T. (m(T,X) & pc2(T))  
                 definition work_invar[0] = _X < next_ticket & pc2(_T) & m(_T,_X)
-                definition work_progress[0](T) = scheduled.now & scheduled.value = T # PROBLEM
-                definition work_helpful[0](T) = m(T,service) & pc2(T) # PROBLEM
+                definition work_progress[0](T) = scheduled.now & scheduled.value = T 
+                definition work_helpful[0](T) = m(T,service) & pc2(T) 
                 
-                definition work_created[1](X) = X <= next_ticket
-                definition work_needed[1](X) = service <= X & X < _X & exists T. (m(T,X) & (pc2(T) | pc3(T)))
-                # forall X, forall T.
-                #   service < X & X < _X & ~m(T,X)
-                #   | service < X & X < _X & ~pc2(T) & ~pc3(T)
-                #   | service = X & X < _X & ~m(T,X)
-                #   | service = X & X < _X & ~pc2(T) & ~pc3(T))
+                definition work_created[1] = true #(X) = X <= next_ticket
+                definition work_needed[1] = exists T. m(T, service) & pc3(T) #(X) = exists T. (m(T,X) & pc3(T)) #(X) = service <= X & X < _X & exists T. (m(T,X) & pc3(T))
                 definition work_invar[1] = _X < next_ticket & pc2(_T) & m(_T,_X)
                 definition work_progress[1](T) = scheduled.now & scheduled.value = T
                 definition work_helpful[1](T) = m(T,service) & pc3(T)
                 
-                invariant forall K:ticket. next_ticket > K & service <= K -> exists T:thread. m(T,K) & ~pc1(T)
-                # forall T, M. ~(pc1(T) & m(T, M) & M ~= 0) | (service > M)
-                # forall T, M. ~pc1(T) | ~m(T,M) | M=0 | service > M
-                invariant forall K:ticket. next_ticket > K & service <= K -> exists T:thread. m(T,K) & ~pc1(T)
-                # forall K, T. ~(next_ticket > K & service <= K) | (~m(T,K) | pc1(T))
-                # forall K, T. ~(next_ticket > K) | ~(service <= K) | (~m(T, K) | pc1(T)) 
-                # forall K, T. ~(next_ticket > K) | ~(service < K) & ~(service = K) | ~m(T,K) | pc1(T)
->>>>>>> 28d8e43 (some more files)
             }
         }   
     }

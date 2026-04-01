@@ -1,0 +1,60 @@
+#lang ivy1.8
+
+type idx
+
+parameter p : idx 
+
+relation begun(X:idx)
+relation done(X:idx)
+
+var trying(X:idx): bool
+var trying_recv(X:idx): bool
+
+after init {
+  begun(X):=false;
+  done(X):=false;
+  trying(X) := false;
+  trying_recv(X):=false;
+}
+
+action send(x:idx) = {
+  trying(X):=true;
+  trying(X):=false;
+  if ~done(x) & ~begun(x) {
+    begun(x):=true;
+  }
+}
+action recv(x:idx) = {
+  trying_recv(x):=true;
+  trying_recv(x):=false;
+
+  if begun(x) {
+    done(x):=true;
+  }
+}
+
+invariant [inv1] done(X) -> begun(X)
+invariant [inv2] ~trying(X)
+invariant [inv3] ~trying_recv(X)
+
+export send
+export recv
+
+isolate proofs = {
+    explicit temporal property [lemma1]
+       forall X:idx. 
+        ((globally eventually trying(X)) & (globally eventually trying_recv(X))) ->
+        (globally begun(X) -> eventually done(X))
+        proof {
+            tactic skolemizenp
+            tactic l2s_auto5 with {
+                definition work_created = true 
+                definition work_needed = begun(_X) & ~done(_X)
+                definition work_invar =begun(_X) & ~done(_X)
+                definition work_progress = trying_recv(_X)
+                definition work_helpful = true
+            }
+        }
+
+} with this 
+
