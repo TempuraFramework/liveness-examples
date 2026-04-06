@@ -20,6 +20,9 @@ relation try_leave_cs(T:proc)
 # initial ring element
 var initial : proc
 
+#############################################################
+# ordering axioms
+#############################################################
 
 axiom [successor_transitivity]
  ( successor(T1, T2) & successor(T2, T3) )  -> ( successor(T1, T3) )
@@ -50,11 +53,6 @@ axiom [descendant_unfold]
   descendant(T,U) ->
 (    successor(T,U) |
     (exists V. successor(T,V) & descendant(V,U)) )
-
-#axiom [successor_injective]
-#  successor(U1,T) & successor(U2,T) -> U1 = U2
-
-#axiom [some_elts] exists T. T~=initial & entered(T)
 
 after init {
   entered(T) := true;
@@ -92,8 +90,6 @@ invariant [at0] exists T. at(T)
 invariant [at1] ~entered(T) -> ~at(T)
 invariant [at2] at(T) -> entered(T)
 invariant [at3] at(T1) & at(T2) -> T1 = T2
-
-
 
 #### this passes
 #explicit temporal property [leaves]
