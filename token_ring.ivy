@@ -1,6 +1,6 @@
 #lang ivy1.8
 
-type proc
+finite type proc 
 
 # whether `proc` has entered the ring
 relation entered(T:proc)
@@ -14,57 +14,62 @@ relation successor(T1:proc, T2:proc)
 # transitive successor relation
 relation descendant(T1:proc, T2:proc)
 
-# fairness conditions
-relation try_enter_ring(T:proc)
+# fairness condition
 relation try_leave_cs(T:proc)
 
 # initial ring element
 var initial : proc
 
+
+axiom [successor_transitivity]
+ ( successor(T1, T2) & successor(T2, T3) )  -> ( successor(T1, T3) )
+
+axiom [successor_antisymmetry]  ~successor(T,T) 
+
+axiom [descendant_transitivity]
+ ( descendant(T1, T2) & descendant(T2, T3) ) -> ( descendant(T1, T3) )
+
+axiom [descendant_totality] T1~=T2 -> (descendant(T1,T2) | descendant(T2,T1))
+
+axiom [successor_uniqueness]
+  successor(T,U1) & successor(T,U2) -> U1 = U2
+
+axiom [descendant_antisymmetry] ~descendant(T,T)
+
+axiom [successor_descendant_compatible]
+   successor(T1,T2) -> descendant(T1,T2)
+
+axiom [descendant_least_element]
+  T~=initial -> descendant(initial,T)
+
+axiom [successor_least_element]
+  ~successor(T, initial)
+
+axiom [descendant_unfold]
+  descendant(T,U) ->
+(    successor(T,U) |
+    (exists V. successor(T,V) & descendant(V,U)) )
+
+#axiom [successor_injective]
+#  successor(U1,T) & successor(U2,T) -> U1 = U2
+
+#axiom [some_elts] exists T. T~=initial & entered(T)
+
 after init {
-  entered(T) := false;
+  entered(T) := true;
   at(T) := false;
-
-  descendant(T1,T2) := false; 
-  successor(T1,T2)  := false;
-
-  try_enter_ring(T) := false;
   try_leave_cs(T) := false;
-
-  entered(initial) := true;
   at(initial) := true;
 }
 
-
-action enter_ring(p: proc, succ: proc) = {
-  # put this requires before enter_ring, this ensures the following invariant
-  # which is outside of the decidable fragment:
-  #  (entered(T) & T ~= initial) -> exists S. successor(S, T)
-
-  require entered(succ) & ~entered(p) & succ ~= p;
-
-  try_enter_ring(p) := true;
-  try_enter_ring(p) := false;
-
-  successor(p, P) := successor(succ, P);
-  successor(p, p) := false;
-
-  successor(succ, P) := false;
-  successor(succ, p) := true;
-
-  descendant(succ, p) := true;
-  descendant(p, X) := descendant(succ, X);
-  descendant(p, p) := false;
-}
-
-action leave_cs(p:proc) = {
+action update_token(p:proc) = {
   require entered(p);
 
   try_leave_cs(p) := true;
   try_leave_cs(p) := false;
 
   if at(p) {
-    if some n: proc. entered(n) & successor(p, n) & descendant(p, n) { 
+    if some n: proc. entered(n) & successor(p,n) { 
       # if p has a successor, pass token to successor.
       at(p) := false;
       at(n) := true;
@@ -77,32 +82,56 @@ action leave_cs(p:proc) = {
 }
 
 
-export enter_ring
-export leave_cs
+export update_token
 
-invariant ~try_enter_ring(T)
-invariant ~try_leave_cs(T)
 
-invariant exists T. at(T) 
-invariant ~entered(T) -> ~at(T)
-invariant at(T) -> entered(T)
-invariant at(T1) & at(T2) -> T1 = T2
+invariant [init0] entered(initial)
+invariant [fair] ~try_leave_cs(T)
+invariant [at0] exists T. at(T) 
+invariant [at1] ~entered(T) -> ~at(T)
+invariant [at2] at(T) -> entered(T)
+invariant [at3] at(T1) & at(T2) -> T1 = T2
 
-invariant successor(T1, T2) -> descendant(T1, T2)
 
-invariant entered(initial)
-invariant ~successor(T, initial) & ~descendant(T, initial)
-#invariant (T ~= initial & entered(T)) -> descendant(T, initial)
 
-invariant ~successor(T,T)
-invariant ~descendant(T,T)
-#invariant [dontcare0] ~entered(T) ->( ~descendant(T,T1) & ~successor(T, T1))
+#### this passes
+#explicit temporal property [leaves]
+#  forall T. (globally eventually try_leave_cs(T)) ->  (globally (entered(T) & at(T) -> eventually ~at(T)))
+#  proof {
+#    tactic skolemizenp;
+#    tactic ranking with {
+#      definition work_created = true
+#      definition work_needed = at(_T)
+#      definition work_invar = entered(_T)
+#      definition work_progress = try_leave_cs(_T)
+#      definition work_helpful = at(_T) 
+#    }
+#  }
 
-invariant [transitivity] forall T1, T2, T3. (
-    T1 ~= T2 & T2 ~= T3 & T3 ~= T1 & 
-    entered(T1) & entered(T2) & entered(T3) & 
-    successor(T1, T2) & successor(T2, T3)) -> descendant(T1, T3)
+explicit temporal property [live]
+  forall T. 
+    (globally eventually try_leave_cs(T)) -> 
+      (globally ((T~=initial & entered(T)) -> eventually at(T)))
+proof {
+  tactic skolemizenp;
+  tactic ranking with {
 
-invariant [antireflexive0] (entered(T1) & entered(T2)) -> ~(successor(T1, T2) & successor(T2, T1))
-invariant [antireflexive1] (entered(T1) & entered(T2)) -> ~(descendant(T1, T2) & descendant(T2, T1))
-invariant [dependency] (entered(T1) & entered(T2) & successor(T1,T2)) -> descendant(T1, T2)
+    # component 0: when some element after us is holding the token.
+    definition work_created[0](U) = entered(U) 
+    definition work_needed[0](U) = descendant(_T, U) & entered(U) & (exists V. entered(V) & at(V) & descendant(_T, V) & (U = V | descendant(V, U)))
+    definition work_invar[0] = entered(_T) & _T~=initial & ~at(_T)
+    definition work_progress[0](U) = try_leave_cs(U) 
+    definition work_helpful[0](U) = descendant(_T, U) & at(U) & entered(U) 
+
+    # component 1: when some element before us is holding the token.
+    definition work_created[2](U) = entered(U)
+    definition work_needed[2](U) = exists V. at(V) & V ~= _T & entered(V) & entered(U) & ~descendant(_T,V) & (U = _T | ((U = V | descendant(V,U)) & descendant(U,_T) ))
+    definition work_invar[2] = entered(_T)  & _T~=initial & ~at(_T)
+    definition work_progress[2](U) = try_leave_cs(U)
+    definition work_helpful[2](U) = at(U) & U ~= _T & ~descendant(_T,U) & entered(U)
+
+  }
+#  showgoals
+}
+
+
