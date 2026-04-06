@@ -45,6 +45,7 @@ axiom [descendant_least_element]
 axiom [successor_least_element]
   ~successor(T, initial)
 
+### XXX: need `complete=fo`
 axiom [descendant_unfold]
   descendant(T,U) ->
 (    successor(T,U) |
@@ -109,9 +110,9 @@ invariant [at3] at(T1) & at(T2) -> T1 = T2
 #  }
 
 explicit temporal property [live]
-  forall T. 
-    (globally eventually try_leave_cs(T)) -> 
-      (globally ((T~=initial & entered(T)) -> eventually at(T)))
+  (forall T. 
+    (globally eventually try_leave_cs(T))) -> 
+  (forall T.    (globally ((T~=initial & entered(T)) -> eventually at(T))))
 proof {
   tactic skolemizenp;
   tactic ranking with {

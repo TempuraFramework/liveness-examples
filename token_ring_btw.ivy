@@ -62,10 +62,7 @@ proof {
   tactic skolemizenp;
   tactic ranking with {
     definition work_created(X:proc) = true
-    definition work_needed(X:proc) =
-    exists H:proc.
-        at(H) &
-        (X = H | X = _P | proc.btw(H,X,_P))
+    definition work_needed(X:proc) = exists H:proc. at(H) & (X = H | X = _P | proc.btw(H,X,_P))
     definition work_invar = ~at(_P)
     definition work_progress(U:proc) = fair(U)
     definition work_helpful(U:proc) = at(U)
