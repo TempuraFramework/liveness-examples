@@ -49,6 +49,7 @@ action pass_token(p1:proc, p2:proc) = {
 
 export pass_token
 
+invariant [ifair] ~fair(P)
 invariant [at0] exists P. at(P)
 invariant [at1] (at(P1) & at(P2)) -> (P1 = P2)
 
@@ -68,11 +69,6 @@ proof {
     definition work_invar = ~at(_P)
     definition work_progress(U:proc) = fair(U)
     definition work_helpful(U:proc) = at(U)
-#    definition work_created(P1:proc, P2:proc) = true
-#    definition work_needed(P1:proc, P2:proc) = at(P1) & proc.btw(P1, P2, _P)
-#    definition work_invar = ~at(_P)
-#    definition work_progress(P) = fair(P)
-#    definition work_helpful(P:proc) = at(P)
   }
 }
 
