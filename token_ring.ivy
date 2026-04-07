@@ -12,6 +12,9 @@ relation at(T:proc)
 relation descendant(T1:proc, T2:proc)
 
 # successor relation
+# NOTE: In this version, successor(T1,T2) is just a macro expression
+# that there are no nodes between T1 and T2 in the descendant relation.
+# This simplifies the number of axioms needed and makes us be decidable.
 relation successor(T1:proc, T2:proc) = ~(exists V. descendant(T1,V)&descendant(V,T2))
 
 # fairness condition
