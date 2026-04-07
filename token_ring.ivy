@@ -8,11 +8,11 @@ relation entered(T:proc)
 # whether `proc` holds the token in the ring
 relation at(T:proc)
 
-# successor relation
-relation successor(T1:proc, T2:proc)
-
 # transitive successor relation
 relation descendant(T1:proc, T2:proc)
+
+# successor relation
+relation successor(T1:proc, T2:proc) = ~(exists V. descendant(T1,V)&descendant(V,T2))
 
 # fairness condition
 relation try_leave_cs(T:proc)
@@ -24,18 +24,18 @@ var initial : proc
 # ordering axioms
 #############################################################
 
-axiom [successor_transitivity]
- ( successor(T1, T2) & successor(T2, T3) )  -> ( successor(T1, T3) )
+#axiom [successor_transitivity]
+# ( successor(T1, T2) & successor(T2, T3) )  -> ( successor(T1, T3) )
 
-axiom [successor_antisymmetry]  ~successor(T,T) 
+#axiom [successor_antisymmetry]  ~successor(T,T) 
 
 axiom [descendant_transitivity]
  ( descendant(T1, T2) & descendant(T2, T3) ) -> ( descendant(T1, T3) )
 
 axiom [descendant_totality] T1~=T2 -> (descendant(T1,T2) | descendant(T2,T1))
 
-axiom [successor_uniqueness]
-  successor(T,U1) & successor(T,U2) -> U1 = U2
+#axiom [successor_uniqueness]
+#  successor(T,U1) & successor(T,U2) -> U1 = U2
 
 axiom [descendant_antisymmetry] ~descendant(T,T)
 
@@ -45,14 +45,14 @@ axiom [successor_descendant_compatible]
 axiom [descendant_least_element]
   T~=initial -> descendant(initial,T)
 
-axiom [successor_least_element]
-  ~successor(T, initial)
+#axiom [successor_least_element]
+#  ~successor(T, initial)
 
 ### XXX: need `complete=fo`
-axiom [descendant_unfold]
-  descendant(T,U) ->
-(    successor(T,U) |
-    (exists V. successor(T,V) & descendant(V,U)) )
+#axiom [descendant_unfold]
+#  descendant(T,U) ->
+#(    successor(T,U) |
+#    (exists V. successor(T,V) & descendant(V,U)) )
 
 after init {
   entered(T) := true;
@@ -114,15 +114,15 @@ proof {
   tactic ranking with {
 
     # component 0: when some element after us is holding the token.
-    definition work_created[0](U) = entered(U) 
-    definition work_needed[0](U) = descendant(_T, U) & entered(U) & (exists V. entered(V) & at(V) & descendant(_T, V) & (U = V | descendant(V, U)))
+    definition work_created[0](U, V) = entered(U)&entered(V) 
+    definition work_needed[0](U, V) = descendant(_T, U) & entered(U) & ( entered(V) & at(V) & descendant(_T, V) & (U = V | descendant(V, U)))
     definition work_invar[0] = entered(_T) & _T~=initial & ~at(_T)
     definition work_progress[0](U) = try_leave_cs(U) 
     definition work_helpful[0](U) = descendant(_T, U) & at(U) & entered(U) 
 
     # component 1: when some element before us is holding the token.
-    definition work_created[2](U) = entered(U)
-    definition work_needed[2](U) = exists V. at(V) & V ~= _T & entered(V) & entered(U) & ~descendant(_T,V) & (U = _T | ((U = V | descendant(V,U)) & descendant(U,_T) ))
+    definition work_created[2](U, V) = entered(U)&entered(V)
+    definition work_needed[2](U, V) =  at(V) & V ~= _T & entered(V) & entered(U) & ~descendant(_T,V) & (U = _T | ((U = V | descendant(V,U)) & descendant(U,_T) ))
     definition work_invar[2] = entered(_T)  & _T~=initial & ~at(_T)
     definition work_progress[2](U) = try_leave_cs(U)
     definition work_helpful[2](U) = at(U) & U ~= _T & ~descendant(_T,U) & entered(U)
