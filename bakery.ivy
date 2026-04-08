@@ -12,7 +12,7 @@ type location = {idle, picking, waiting, critical}
 
 individual pc(T:thread) : location
 individual number(T:thread) : ticket
-relation choosing(T:thread) # ??? why is this needed?
+#relation choosing(T:thread) # ??? why is this needed?
 
 ## become_critical(T) whenever T is allowed to enter the critical section.
 # 1. No other thread is in the 'choosing' phase.
@@ -34,7 +34,7 @@ relation fair_leave_critical(T:thread)
 after init {
     pc(T) := idle;
     number(T) := 0;      
-    choosing(T) := false;
+#    choosing(T) := false;
 
     fair_start_picking(T) := false;
     fair_waiting(T) := false;
@@ -49,7 +49,7 @@ action start_picking(t:thread) = {
     fair_start_picking(t) := false;
 
     if pc(t) = idle {
-      choosing(t) := true;
+#      choosing(t) := true;
       pc(t) := picking;
     }
 }
@@ -64,7 +64,7 @@ action finish_picking(t:thread, n: ticket) = {
 
     if pc(t) = picking {
       number(t) := n;
-      choosing(t) := false;
+#      choosing(t) := false;
       pc(t) := waiting;
     }
 }
@@ -98,12 +98,18 @@ invariant [mutex] (pc(T1) = critical & pc(T2) = critical) -> T1 = T2
 # State Consistency
 invariant [valid_ticket] (pc(T) = waiting | pc(T) = critical) -> number(T) > 0
 invariant [no_ticket_idle] (pc(T) = idle | pc(T) = picking) -> number(T) = 0
-invariant [choosing_pc] choosing(T) <-> pc(T) = picking
+#invariant [choosing_pc] choosing(T) <-> pc(T) = picking
 
 # The Ordering Invariant 
 # If T1 is critical, and T2 has a ticket, T1 must be "smaller" than T2.
 invariant [ordering] (pc(T1) = critical & T1 ~= T2 & number(T2) > 0) ->
     (number(T1) < number(T2) | (number(T1) = number(T2) & T1 < T2))
+
+# fairness invariants
+invariant ~fair_start_picking(T)
+invariant ~fair_waiting(T)
+invariant ~fair_critical(T)
+invariant ~fair_leave_critical(T)
 
 export start_picking
 export finish_picking
@@ -129,13 +135,13 @@ explicit temporal property [starvation_freedom]
 proof {
   tactic skolemizenp;
   tactic ranking with {
-    definition work_created[0](T:thread) =  lexlt(T, _T) & (number(T) > 0 | choosing(T))
+    definition work_created[0](T:thread) =  lexlt(T, _T) & (number(T) > 0 | pc(T) = picking)
     definition work_needed[0](T:thread) = pc(T) ~= idle & lexlt(T, _T)
     definition work_invar[0] = pc(_T) = waiting
     definition work_progress[0](T:thread) = fair_critical(T)
-    definition work_helpful[0](T:thread) = lexlt(T, _T) & pc(T) ~= waiting
+    definition work_helpful[0](T:thread) = lexlt(T, _T) & pc(T) = waiting
 
-    definition work_created[1](T:thread) =  lexlt(T, _T) & (number(T) > 0 | choosing(T))
+    definition work_created[1](T:thread) =  lexlt(T, _T) & (number(T) > 0 | pc(T) = picking)
     definition work_needed[1](T:thread) = pc(T) = critical & lexlt(T, _T)
     definition work_invar[1] = pc(_T) = waiting
     definition work_progress[1](T:thread) = fair_leave_critical(T)
