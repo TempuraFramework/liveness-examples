@@ -1,0 +1,58 @@
+#lang ivy1.8
+
+include order
+
+instance time: unbounded_sequence
+
+relation pending(X:time)
+relation completed(X:time)
+
+var lt : time
+var fair : bool
+
+after init {
+  lt := 0;
+  lt := lt.next;
+  fair := false;
+  pending(T) := false;
+  completed(T) := false;
+}
+
+action enter = {
+  var tt:time := lt;
+  lt := lt.next;
+  pending(tt) := true;
+  completed(tt) := false;
+}
+
+action leave = {
+  fair := true;
+  fair := false;
+  if some tt:time. pending(tt) minimizing tt {
+    pending(tt) := false;
+    completed(tt) := true;
+  }
+}
+
+export enter 
+export leave 
+
+invariant ~fair
+invariant forall T. lt <=T -> ~pending(T)
+invariant forall T. lt <= T -> ~completed(T)
+
+explicit temporal property [live]
+  forall T:time. 
+    (globally eventually fair) ->
+    (globally pending(T) -> eventually completed(T))
+proof {
+  tactic skolemizenp;
+  tactic ranking with {
+    definition work_created(T:time) =  T<lt & pending(T)
+    definition work_needed(T:time) = pending(T) & T<_T
+    definition work_invar = pending(_T)
+    definition work_progress = fair 
+    definition work_helpful = true
+  }
+}
+

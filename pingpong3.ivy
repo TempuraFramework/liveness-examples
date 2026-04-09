@@ -1,0 +1,80 @@
+#lang ivy1.8
+
+include order
+
+instance time: unbounded_sequence
+
+relation pending(X:time)
+relation completed(X:time)
+
+var lt : time
+var fair : bool
+var blocked : bool
+
+after init {
+  lt := 0;
+  lt := lt.next;
+  fair := false;
+  pending(T) := false;
+  completed(T) := false;
+  blocked := false;
+}
+
+action enter = {
+  if ~blocked {
+    var tt:time := lt;
+    lt := lt.next;
+    pending(tt) := true;
+    completed(tt) := false;
+    blocked := true;
+  }
+}
+
+action leave = {
+  fair := true;
+  fair := false;
+  if some tt:time. pending(tt) minimizing tt {
+    pending(tt) := false;
+    completed(tt) := true;
+    blocked := false;
+  }
+}
+
+export enter 
+export leave 
+
+##########################################################################
+# usual invariants.
+# [u2], [u3] are needed to prove finiteness of work_created predicate
+# in the unblocked, unbounded version of the queue.
+
+invariant [u1] ~fair
+invariant [u2] lt <=T -> ~pending(T)
+invariant [u3] lt <= T -> ~completed(T)
+invariant [u4] pending(T) -> ~completed(T)
+
+##########################################################################
+# invariants about the blocking property of the queue.
+# [b1], [b2] are needed to prove [b3].
+
+invariant [b1] blocked -> (exists T. pending(T))
+invariant [b2] pending(T) -> blocked
+invariant [b3] forall T1,T2. pending(T1) & pending(T2) -> T1 = T2
+
+
+# having assumed [b1]-[b3], we can do a liveness proof with a one-element ranking.
+explicit temporal property [live]
+  forall T:time. 
+    (globally eventually fair) ->
+    (globally pending(T) -> eventually completed(T))
+proof {
+  tactic skolemizenp;
+  tactic ranking with {
+    definition work_created =  true
+    definition work_needed = pending(_T)
+    definition work_invar = pending(_T)
+    definition work_progress = fair 
+    definition work_helpful = true
+  }
+}
+

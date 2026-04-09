@@ -34,7 +34,6 @@ module simple_queue(nat) with nat = {
 
     invariant [inv1] begun(X) & done(X) & Y < X & begun(Y) -> done(Y)
     invariant [inv2] done(X) -> begun(X)
-    invariant [inv3] ~(X:nat < 0)
     invariant [t] ~trying 
 } 
 
