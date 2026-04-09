@@ -3,6 +3,7 @@
 | File Name | Description | Property | Fairness Conditions | Rule | Remarks | Model OK? | Proof OK? | Manual Automation OK?| Auto Automation OK?|
 |-----------|-------------|----------|---------------------|------|---------|-----------|-----------|---------------|----------|
 |`one_queue.ivy`| Single unbounded FIFO queue, non-consecutive issue timestamps | $\square\forall X. begun(X) -> \Diamond done(X)$   | $\square \diamond recv$ | AUTO2 | n/a | Yes | Yes | Yes | No |
+| `one_queue_unord.ivy` | Unbounded unordered channel | same as above | $\forall X. \square\diamond recv(X)$ | AUTO2 | n/a | Yes | Yes | Yes | No |
 |`pingpong1.ivy`| Single unbounded FIFO queue, consecutive issue timestamps | same as above | same as above | AUTO2 | n/a | Yes | Yes | Yes | No |
 |`pingpong2.ivy`| Blocking unbouned FIFO queue, at most one element in flight | same as above | same as above | AUTO2 | n/a | Yes | Yes | Yes | No |
 |`pingpong3.ivy`| Blocking unbounded FIFO queue with invariant showing at most one element in flight | same as above | same as above | finite | n/a | Yes | Yes | Yes | No |
