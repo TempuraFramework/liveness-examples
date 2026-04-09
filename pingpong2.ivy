@@ -65,4 +65,15 @@ proof {
     definition work_helpful = true
   }
 }
-
+# NOTE: the below proof fails, unless we state extra invariants (cf. `pingpong3.ivy`)
+#proof {
+#  tactic skolemizenp;
+#  tactic ranking with {
+#    definition work_created =  true
+#    definition work_needed = pending(_T)
+#    definition work_invar = pending(_T)
+#    definition work_progress = fair
+#    definition work_helpful = true
+#  }
+#}
+#
