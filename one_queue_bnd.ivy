@@ -1,0 +1,65 @@
+#lang ivy1.8
+
+include order
+
+instance idx : unbounded_sequence
+
+relation pending(T:idx)
+relation completed(T:idx)
+
+parameter bnd : idx
+var fair : bool
+var fair_send(T:idx) : bool
+
+after init {
+  pending(T) := false;
+  completed(T) := false;  
+  fair := false;
+  fair_send(T) := false;
+}
+
+action send(t:idx) = {
+  require t<=bnd & ~pending(t) & ~completed(t);
+
+  fair_send(t) := true;
+  fair_send(T) := false;
+  pending(t) := true;
+}
+
+action recv = {
+  fair := true;
+  fair := false;
+  if some tt:idx. pending(tt) {
+    pending(tt) := false;
+    completed(tt) := true;
+  }
+}
+
+export send
+export recv
+
+invariant T>bnd -> ~pending(T)
+invariant ~fair
+invariant ~fair_send(T)
+invariant completed(T) -> ~pending(T)
+
+explicit temporal property [live]
+  (forall T. 
+    ((globally eventually fair) & (globally eventually fair_send(T)))) ->
+  forall T.  (globally pending(T) -> eventually ~pending(T))
+proof {
+  tactic skolemizenp;
+  tactic ranking with {
+    definition work_created[0](T:idx) = T<=bnd 
+    definition work_needed[0](T:idx) = T<=bnd & ~pending(T) & ~completed(T)
+    definition work_invar[0] = pending(_T) & _T <= bnd & ~completed(_T)
+    definition work_progress[0](T) = fair_send(T)
+    definition work_helpful[0](T) =  T<=bnd & ~pending(T) & ~completed(T)
+
+    definition work_created[1](T:idx) = T<=bnd #& pending(T) & ~completed(T)
+    definition work_needed[1](T:idx) = T<=bnd & pending(T) & ~completed(T)
+    definition work_invar[1] = pending(_T) & _T <= bnd & ~completed(_T)
+    definition work_progress[1] = fair
+    definition work_helpful[1] = true
+  }
+}
