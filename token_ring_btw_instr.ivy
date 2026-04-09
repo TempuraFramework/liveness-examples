@@ -68,7 +68,7 @@ proof {
     definition work_needed(X:proc) = at(token_holder) & (X = token_holder | X = _P | proc.btw(token_holder,X,_P))
     definition work_invar = ~at(_P)
     definition work_progress(U:proc) = fair(U)
-    definition work_helpful(U:proc) = at(U)
+    definition work_helpful(U:proc) = (U=token_holder)
   }
 }
 
