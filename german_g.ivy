@@ -85,12 +85,9 @@ action nexttime returns (x:lclock) = {
 # Client-side request generation
 # --------------------------------------------------------------------
 
-action send_read_shared(c:client) = {
+action client_send_request(c:client, is_exclusive: bool) = {
     require ~waiting(c);
     require cache(c) = invalid;
-    require forall T. ~active(T) | ~in_chan1(T) | ~is_request_from(T, C);
-    require forall T. ~active(T) | ~in_chan2(T) | ~is_request_from(T, C);  
-# require ~chan3(c);
     
     var tt :lclock ;
     call tt := nexttime;
@@ -101,28 +98,12 @@ action send_read_shared(c:client) = {
     completed(tt) := false;
     is_request_from(tt,c) := true;
     is_reply_from(tt) := false;
-    kind_of_msg(tt) := req_read_shared;
+    if is_exclusive {
+      kind_of_msg(tt) := req_read_exclusive;
+    } else {
+      kind_of_msg(tt) := req_read_shared;
+    }
     waiting(c) := true
-}
-
-action send_read_exclusive(c:client) = {
-    require ~waiting(c);
-    require cache(c) = invalid;
-    require forall T. ~active(T) | ~in_chan1(T) | ~is_request_from(T, C); 
-    require forall T. ~active(T) | ~in_chan2(T) | ~is_request_from(T, C);
-# require ~chan3(c);
-    
-    var tt : lclock;
-    call tt := nexttime;
-    assert tt < lt;
-    in_chan1(tt) := true;
-    issued(tt) := true;
-    processing(tt) := false;
-    completed(tt) := false;
-    is_request_from(tt, c) := true;
-#chan1(c) := req_read_exclusive;
-    
-    waiting(c) := true;
 }
 
 # --------------------------------------------------------------------
@@ -138,7 +119,7 @@ action home_accept_request(c:client) = {
 #    require ~chan3(c);
 
     if some tt:lclock. active(tt) & in_chan1(tt) & is_request_from(tt, c) minimizing tt {
-      assert (kind_of_msg(tt) = req_read_shared | kind_of_msg(tt) = req_read_exclusive);
+      assert [home_accept_request_a] (kind_of_msg(tt) = req_read_shared | kind_of_msg(tt) = req_read_exclusive);
       home_client := c;
       home_msg := tt;
       in_chan1(tt) := false;
@@ -173,18 +154,21 @@ action home_accept_request(c:client) = {
 # --------------------------------------------------------------------
 
 action home_send_invalidate(c:client) = {
+    require home_status = pending;
 
-    if (home_status = pending & invalidate_list(c)) { 
+
+    if invalidate_list(c) { 
       var tt : lclock;
       call tt:=nexttime;
       assert tt < lt;
-#TODO 
-      is_request_from(tt,c) := true;
+      assert forall T. active(T) -> T < tt;
+      is_request_from(tt,C) := false;
+      issued(tt) := true;
       processing(tt) := false;
+      completed(tt) := false;
       kind_of_msg(tt) := rep_invalidate;
       in_chan2(tt) := true;
       is_reply_from(tt) := true;
-      kind_of_msg(tt) := req_read_shared;
       invalidate_list(c) := false;
     }
 }
@@ -201,7 +185,7 @@ action client_process_reply(c:client) = {
 #    chan3(c) := true;
 
     if some tt:lclock. in_chan2(tt) & active(tt) & is_request_from(tt, c) minimizing tt {
-      assert is_reply_from(tt);
+      assert [client_process_reply_a] is_reply_from(tt);
 
       if kind_of_msg(tt) = rep_invalidate {
         cache(c) := invalid;
@@ -210,6 +194,7 @@ action client_process_reply(c:client) = {
         in_chan3(tt) := true;
         kind_of_msg(tt) := msg_invalid_ack;
         is_reply_from(tt) := false;
+        is_request_from(tt, c) := true;
       }
       else if kind_of_msg(tt) = rep_grant_shared {
         cache(c) := shared;
@@ -276,19 +261,21 @@ action home_send_grant = {
 #    require chan2(home_client) = no_msg;
     
     var tt:lclock := home_msg;
-    assert is_request_from(tt, home_client);
     assert processing(tt);
+    assert is_request_from(tt, home_client);
 
     if home_cmd = req_read_shared {
       processing(tt) := false;
       in_chan2(tt) := true;
       kind_of_msg(tt) := rep_grant_shared;
+      is_reply_from(tt) := true;
       dir(home_client) := shared;
     }
     else {
       # read_exclusive, TODO assert
       processing(tt) := false;
       in_chan2(tt) := true;
+      is_reply_from(tt) := true;
       kind_of_msg(tt) := rep_grant_exclusive;
       dir(home_client) := exclusive;
     };
@@ -303,14 +290,12 @@ action home_send_grant = {
 # Expose every atomic protocol step
 # --------------------------------------------------------------------
 
-export send_read_shared
-export send_read_exclusive
+export client_send_request
 export home_accept_request
 export home_send_invalidate
-export client_process_invalidate
+export client_process_reply
 export home_process_invalidate_ack
 export home_send_grant
-export client_receive_grant
 
 # --------------------------------------------------------------------
 # Safety invariants
@@ -318,20 +303,56 @@ export client_receive_grant
 
 # Cache coherence property:
 # if one client is exclusive, every other client is invalid.
-invariant ~(X:client ~= Y & cache(X) = exclusive & cache(Y) ~= invalid)
+#invariant [cc] ~(X:client ~= Y & cache(X) = exclusive & cache(Y) ~= invalid)
 
 # Home directory coherence:
 # if the directory says one client is exclusive, every other directory entry is invalid.
-invariant ~(X:client ~= Y & dir(X) = exclusive & dir(Y) ~= invalid)
+invariant ~(X:client ~= Y & dir(X) = exclusive & dir(Y) ~= invalid) # TODO
 
+# Invariants about time
+invariant [b1] active(T) -> T < lt
+invariant [b2] completed(T) -> issued(T)
+invariant [b3] completed(T) -> ~( in_chan1(T) | in_chan2(T) | in_chan3(T) | processing(T) )
+
+# Invariants about home status
+invariant [c1] home_status = pending -> ( issued(home_msg) & processing(home_msg))
+invariant [c2] home_status = respond -> ( issued(home_msg) & processing(home_msg))
+
+# Invariants about position of messages
+invariant [pos1] ~issued(T) -> ~( in_chan1(T) | in_chan2(T) | in_chan3(T) | processing(T) )
+invariant [pos2] (issued(T) & ~completed(T)) ->
+  ((in_chan1(T) & ~processing(T) & ~in_chan2(T) & ~in_chan3(T)) | 
+   (in_chan2(T) & ~processing(T) & ~in_chan1(T) & ~in_chan3(T)) | 
+   (in_chan3(T) & ~processing(T) & ~in_chan1(T) & ~in_chan2(T)) |
+   (processing(T) & ~in_chan1(T) & ~in_chan2(T) & ~in_chan3(T)))
+
+# Invariants about Channel 1
+invariant [chan1_1] in_chan1(T) -> (issued(T) & ~completed(T))
+invariant [chan1_2] in_chan1(T) -> (kind_of_msg(T) = req_read_shared | kind_of_msg(T) = req_read_exclusive)
+invariant [chan1_3] in_chan1(T) -> exists C. is_request_from(T, C)
+invariant [chan1_4] in_chan1(T) -> ~is_reply_from(T)
+
+# Invariants about Channel 2
+invariant [chan2_1] in_chan2(T) -> (issued(T) & ~completed(T))
+invariant [chan2_2] in_chan2(T) -> (kind_of_msg(T) = rep_invalidate | kind_of_msg(T) = rep_grant_shared | kind_of_msg(T) = rep_grant_exclusive)
+invariant [chan2_3] in_chan2(T) -> is_reply_from(T)
+# Invariants about Channel 3
+invariant [chan3_1] in_chan3(T) -> (issued(T) & ~completed(T))
+invariant [chan3_2] in_chan3(T) -> kind_of_msg(T) = msg_invalid_ack
+invariant [chan3_3] in_chan3(T) -> ~is_reply_from(T) 
+invariant [chan3_4] in_chan3(T) -> exists C. is_request_from(T, C)
+# Invariants about processing channel
+invariant [processing_1] processing(T) -> (issued(T) & ~completed(T))
+invariant [processing_2] processing(T) -> exists C. is_request_from(T, C)
+invariant [processing_3] home_status ~= inactive -> processing(home_msg)
+invariant [processing_4] home_status ~= inactive <-> home_cmd ~= nop
+invariant [processing_5] home_status ~= inactive -> is_request_from(home_msg, home_client)
 # An invalidate acknowledgement means the client has already dropped its copy.
 #invariant chan3(X:client) -> cache(X) = invalid
+
 
 # Message/directory consistency for in-flight home->client messages.
 #invariant chan2(X:client) = invalidate -> dir(X) ~= invalid
 #invariant chan2(X:client) = grant_shared -> dir(X) = shared
 #invariant (chan2(X:client) = grant_exclusive ) -> dir(X) = exclusive
 
-# Home bookkeeping sanity.
-invariant home_status = inactive -> home_cmd = nop
-invariant home_cmd = nop -> home_status = inactive
