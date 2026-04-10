@@ -176,13 +176,13 @@ isolate ticket_protocol = {
                 # the delta_i. In this case R_i is the same for both
                 # rankings.
 
-                definition work_created[0](X,T:thread) = X <= next_ticket
+                definition work_created[0](X,T:thread) = service <= X & X <= _X & (m(T,X) & pc2(T)) #X <= next_ticket
                 definition work_needed[0](X,T) = service <= X & X <= _X & (m(T,X) & pc2(T))
                 definition work_invar[0] = _X < next_ticket & pc2(_T) & m(_T,_X)
                 definition work_progress[0](T) = scheduled.now & scheduled.value = T
                 definition work_helpful[0](T) = m(T,service) & pc2(T)
                 
-                definition work_created[1](T:thread) = true
+                definition work_created[1](T:thread) = (m(T,service) & pc3(T)) #true
                 definition work_needed[1](T) = (m(T,service) & pc3(T))
                 definition work_invar[1] = _X < next_ticket & pc2(_T) & m(_T,_X)
                 definition work_progress[1](T) = scheduled.now & scheduled.value = T

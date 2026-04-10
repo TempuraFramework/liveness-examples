@@ -70,7 +70,7 @@ explicit temporal property [live]
 proof {
   tactic skolemizenp;
   tactic ranking with {
-    definition work_created =  true
+    definition work_created =  pending(_T)
     definition work_needed = pending(_T)
     definition work_invar = pending(_T)
     definition work_progress = fair 

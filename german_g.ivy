@@ -7,6 +7,11 @@
 # Channel 3 : client -> home invalidate acknowledgements
 # --------------------------------------------------------------------
 
+
+# Questions
+# 1. If a client receives an invalidation instead of a reply to a request, what does it do?
+# 2. If a server sends back an ACK but then receives a stray invalidate, what does it do?
+
 include order 
 
 type client
@@ -357,7 +362,11 @@ invariant [home_inv_1] home_cmd = nop | home_cmd = req_read_shared | home_cmd = 
 # An invalidate acknowledgement means the client has already dropped its copy.
 invariant [grant0] (in_chan2(T) & kind_of_msg(T) = rep_grant_shared) -> exists C. is_request_from(T, C)
 invariant [grant1] (in_chan2(T) & kind_of_msg(T) = rep_grant_exclusive) -> exists C. is_request_from(T, C)
+
+#invariant [wait] waiting(C) & is_request_from(T, C) -> (exists T. in_chan1(T) & is_request_from(T, C) | in_chan2(T) & is_request_from(T, C)) 
+
 invariant [grant2] (in_chan2(T) & kind_of_msg(T) = rep_grant_shared & is_request_from(T, C)) -> dir(C) ~= invalid
+#invariant [invalidate_msg] dir(C) = invalid -> ~(exists T. in_chan2(T) & is_request_from(T, C) & (kind_of_msg(T) = rep_grant_shared | kind_of_msg(T) = rep_grant_exclusive))
 #invariant [invalidate_acked] dir(C) = invalid -> cache(C) = invalid
 #invariant [invalidate_ack] in_chan3(T) & is_request_from(T, C) ->  cache(C) = invalid
 

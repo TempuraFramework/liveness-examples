@@ -50,7 +50,7 @@ explicit temporal property [live]
 proof {
   tactic skolemizenp;
   tactic ranking with {
-    definition work_created[0](T:idx) = true 
+    definition work_created[0](T:idx) = T<=bnd & ~pending(T) 
     definition work_needed[0](T:idx) = T<=bnd & ~pending(T) & ~completed(T)
     definition work_invar[0] = pending(_T) & _T <= bnd & ~completed(_T)
     definition work_progress[0](T) = fair_send(T)
