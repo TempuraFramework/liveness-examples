@@ -258,10 +258,10 @@ proof {
     definition work_helpful[0](N:node) = (N~=server & N~=client) & replicate_list(N) & ~responded(N) & ~request_channel(N)
     
     definition work_created[1](N:node) = true
-    definition work_needed[1](N:node) = (N~=server & N~=client) & ~responded(N) 
+    definition work_needed[1](N:node) = (N~=server & N~=client) & responded(N) 
     definition work_invar[1] = server_state = requesting
-    definition work_progress[1](N:node) = backup_handle_replicate_request(N)
-
+    definition work_progress[1](N:node) = backup_handle_replicate_request_fair(N)
+    definition work_helpful[1](N:node) = (N~=server & N~=client) 
   }
 }
 
