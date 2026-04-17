@@ -1,0 +1,267 @@
+#lang ivy1.8
+
+########################################
+# Primary/backup Replication Protocol
+#
+# In this protocol, a client can send periodic requests to a distinguished
+# primary server for it to replicate data to other backup servers. The
+# primary server only acknowledges the client request once all backup servers
+# have acknowledged the replication command. We assume the client does not send
+# redundant requests; that is, the client blocks until the server acknowledges.
+
+# A datatype for nodes
+finite type node
+
+# A datatype for states of the primary server
+type state_t = { idling, requesting, acking }
+
+# Assume there is a distinguished primary server
+var server : node 
+
+# Assume there is a distinguished client
+var client : node 
+
+# Server state
+var server_state : state_t
+
+### Relations modeling channels between processes. We assume each channel has unit capacity.
+
+# request_channel(c) is the channel used for client to send messages to server
+# if c is a client. Otherwise, request_channel(c) is used for server to messages
+# to backup servers. respond_channel(c) is used for server to reply messages to client
+# if c is a client. Otherwise, respond_channel(c) is used for backup servers to
+# send acknowledgements to the server.
+relation request_channel(C:node) 
+relation respond_channel(C:node)
+
+# Every node that isn't the server or the client is a backup server.
+relation is_backup_server(N:node) 
+
+# Replication list stores all backup server node IDs that server needs to send replicate command to.
+relation replicate_list(N:node)
+
+# List of backup servers who have replied to the server's replicate command.
+relation responded(N:node)
+
+# Axiom enforcing that client/primary server are distinct.
+axiom server ~= client
+
+# Axiom enforcing that there is at least one backup server other than the primary and client.
+axiom exists N. N ~= server & N ~= client
+
+### Fairness constraints for proving liveness
+var server_handle_replicate_request_fair : bool
+var server_send_replicate_request_fair(N:node) : bool
+var backup_handle_replicate_request_fair(N:node) : bool
+var server_handle_replicate_ack_fair : bool
+var client_handle_server_ack_fair : bool
+
+after init {
+
+  is_backup_server(N) := (N ~= server) & (N ~= client);
+  replicate_list(N)   := (N ~= server) & (N ~= client);
+  responded(N) := false;
+  request_channel(C) := false;
+  respond_channel(C) := false;
+  server_state := idling;
+
+  server_handle_replicate_request_fair := false;
+  server_send_replicate_request_fair(N) := false;
+  backup_handle_replicate_request_fair(N) := false;
+  server_handle_replicate_ack_fair := false;
+  client_handle_server_ack_fair := false;
+}
+
+action client_send_replicate_request = {
+  require server_state = idling;
+  require ~respond_channel(server);
+  require ~request_channel(client);
+  require ~respond_channel(client);
+
+  request_channel(server) := true;
+}
+
+action server_handle_replicate_request = {
+
+  server_handle_replicate_request_fair := true;
+  server_handle_replicate_request_fair := false;
+
+  require server_state = idling;
+  require ~respond_channel(C);
+  require request_channel(server);
+  require C~=client -> ~respond_channel(C);
+
+  request_channel(server) := false;
+  replicate_list(N) := (N~=server) & (N~=client);
+  responded(N) := false;
+  server_state := requesting;
+}
+
+action server_send_replicate_request(n:node) = {
+
+  server_send_replicate_request_fair(n) := true;
+  server_send_replicate_request_fair(n) := false;
+
+  require server_state = requesting;
+  require n~= server;
+  require n~= client;
+  require ~request_channel(n);
+  require ~respond_channel(n);
+  require replicate_list(n);
+
+  request_channel(n) := true;
+  responded(n) := false;
+}
+
+action backup_handle_replicate_request(n:node) = {
+
+  backup_handle_replicate_request_fair(n) := true;
+  backup_handle_replicate_request_fair(n) := false;
+
+  require n~= server;
+  require n~= client;
+  require request_channel(n);
+
+  respond_channel(n) := true;
+  request_channel(n) := false;
+}
+
+action server_handle_replicate_ack = {
+
+  server_handle_replicate_ack_fair := true;
+  server_handle_replicate_ack_fair := false;
+
+  require server_state = requesting;
+
+  if some n:node. n~=server & n~=client & respond_channel(n) {
+      replicate_list(n) := false;
+      responded(n) := true;
+      respond_channel(n) := false;
+  } else {
+    if forall N:node. (N~=server & N~=client -> responded(N)) {
+      server_state := acking;
+      respond_channel(server) := true;
+      responded(N) := false;
+    }
+  }  
+}
+
+action client_handle_server_ack = {
+
+  client_handle_server_ack_fair := true;
+  client_handle_server_ack_fair := false;
+
+  require server_state = acking;
+#assert respond_channel(server);
+
+  respond_channel(server) := false;
+  # reset system state
+  is_backup_server(N) := (N ~= server) & (N ~= client);
+  replicate_list(N)   := (N ~= server) & (N ~= client);
+  responded(N) := false;
+  server_state := idling;
+}
+
+export client_send_replicate_request
+export server_handle_replicate_request
+export server_send_replicate_request 
+export backup_handle_replicate_request
+export server_handle_replicate_ack
+export client_handle_server_ack 
+
+### Fairness invariants
+invariant  ~server_handle_replicate_request_fair 
+invariant ~server_send_replicate_request_fair(N) 
+invariant ~backup_handle_replicate_request_fair(N) 
+invariant ~server_handle_replicate_ack_fair 
+invariant ~client_handle_server_ack_fair 
+
+
+### Actual invariants
+invariant [backup_partition]
+      is_backup_server(N) <-> (N ~= server & N ~= client)
+
+invariant [replication_targets_are_backups]
+      replicate_list(N) -> is_backup_server(N)
+
+invariant [acked_nodes_are_backups]
+      responded(N) -> is_backup_server(N)
+
+invariant [idle_clears_acked]
+      server_state = idling -> ~responded(N)
+
+invariant [idle_replist_is_full]
+      server_state = idling -> (replicate_list(N) <-> is_backup_server(N))
+
+invariant [primary_request_stays_in_idle]
+      request_channel(server) -> server_state = idling
+
+invariant [i00]  ~(request_channel(N) & respond_channel(N))
+invariant [i0] (N ~=server & N~=client & server_state = acking) -> (~request_channel(N))
+invariant [i] (N ~=server & N~=client & server_state = idling) -> (~request_channel(N))
+
+### FAILS
+#invariant [backup_request_is_inflight]
+#      (N ~= server & N ~= client & request_channel(N)) ->
+#          (server_state = requesting & ~replicate_list(N) & ~responded(N))
+
+invariant [server_reply_only_in_acking]
+      respond_channel(server) -> server_state = acking
+
+### FAILS
+#invariant [backup_reply_means_sent]
+#      (N ~= server & N ~= client & respond_channel(N)) ->
+#          (server_state = requesting & ~replicate_list(N) & ~responded(N))
+
+invariant (server_state = requesting & N~=server & N~=client & request_channel(N)) -> replicate_list(N)
+
+invariant [r2] (N~=server & N~=client & request_channel(N)) -> replicate_list(N)
+invariant [r1] (N~=server & N~=client & replicate_list(N)) -> ~responded(N)
+invariant [r0] (N~=server & N~=client & responded(N)) -> ~replicate_list(N)
+
+
+invariant (N~=server & N~=client & responded(N)) -> ~replicate_list(N)
+invariant [acked_implies_sent]
+      responded(N) -> ~replicate_list(N)
+
+invariant [acking_has_client_reply]
+      server_state = acking -> respond_channel(server)
+
+invariant [acking_means_all_sent]
+      (server_state = acking & N ~= server & N ~= client) -> ~replicate_list(N)
+
+### FAILS
+#invariant [acking_means_all_acked]
+#      (server_state = acking & N ~= server & N ~= client) -> responded(N)
+
+
+explicit temporal axiom [fair1] globally eventually server_handle_replicate_request_fair
+explicit temporal axiom [fair2] forall N. (globally eventually server_send_replicate_request_fair(N))
+explicit temporal axiom [fair3] forall N. (globally eventually backup_handle_replicate_request_fair(N)) 
+explicit temporal axiom [fair4] globally eventually server_handle_replicate_ack_fair
+explicit temporal axiom [fair5] globally eventually client_handle_server_ack_fair
+
+explicit temporal property [live0]
+  globally server_state = requesting -> eventually server_state = acking
+proof {
+  tactic skolemizenp;
+  instantiate fair1;
+  instantiate fair2;
+  instantiate fair3;
+  instantiate fair4;
+  instantiate fair5;
+  tactic ranking with {
+    definition work_created[0](N:node) = true 
+    definition work_needed[0](N:node) = (N~=server & N~=client) & replicate_list(N) & ~responded(N) 
+    definition work_invar[0] = server_state = requesting 
+    definition work_progress[0](N:node) = server_send_replicate_request_fair(N)
+    definition work_helpful[0](N:node) = (N~=server & N~=client) & replicate_list(N) & ~responded(N) & ~request_channel(N)
+    
+    definition work_created[1](N:node) = true
+    definition work_needed[1](N:node) = (N~=server & N~=client) & ~responded(N) 
+    definition work_invar[1] = server_state = requesting
+    definition work_progress[1](N:node) = backup_handle_replicate_request(N)
+
+  }
+}
+

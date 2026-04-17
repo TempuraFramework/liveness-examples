@@ -170,6 +170,7 @@ action home_send_invalidate(c:client) = {
       assert tt < lt;
       assert forall T. active(T) -> T < tt;
       is_request_from(tt,C) := false;
+      is_request_from(tt,c) := true;
       issued(tt) := true;
       processing(tt) := false;
       completed(tt) := false;
@@ -355,6 +356,22 @@ invariant [processing_2] processing(T) -> exists C. is_request_from(T, C)
 invariant [processing_3] home_status ~= inactive -> processing(home_msg)
 invariant [processing_4] home_status ~= inactive <-> home_cmd ~= nop
 invariant [processing_5] home_status ~= inactive -> is_request_from(home_msg, home_client)
+invariant [processing_6] processing(T) -> (kind_of_msg(T) = req_read_shared | kind_of_msg(T) = req_read_exclusive)
+invariant [processing_7] processing(T) -> ~is_reply_from(T)
+invariant [home_cmd_msg] home_status ~= inactive -> kind_of_msg(home_msg) = home_cmd
+invariant [chan2_inv_client] (in_chan2(T) & kind_of_msg(T) = rep_invalidate) -> exists C. is_request_from(T,C)
+invariant [chan3_pending] in_chan3(T) -> home_status = pending
+invariant [chan3_unique_client] (in_chan3(T) & in_chan3(U) & is_request_from(T,C) & is_request_from(U,C)) -> T = U
+invariant [chan2_inv_unique_client] (in_chan2(T) & in_chan2(U) & kind_of_msg(T) = rep_invalidate & kind_of_msg(U) = rep_invalidate & is_request_from(T,C) & is_request_from(U,C)) -> T = U
+invariant [chan2_chan3_disjoint_client] (in_chan2(T) & kind_of_msg(T) = rep_invalidate & in_chan3(U) & is_request_from(T,C) & is_request_from(U,C)) -> false
+invariant [invlist_no_chan2_client] (invalidate_list(C) & in_chan2(T) & kind_of_msg(T) = rep_invalidate & is_request_from(T,C)) -> false
+invariant [invlist_no_chan3_client] (invalidate_list(C) & in_chan3(T) & is_request_from(T,C)) -> false
+invariant [inv_msg_dir_shared] (home_status = pending & home_cmd = req_read_shared & in_chan2(T) & kind_of_msg(T) = rep_invalidate & is_request_from(T,C)) -> dir(C) = exclusive
+invariant [inv_ack_dir_shared] (home_status = pending & home_cmd = req_read_shared & in_chan3(T) & is_request_from(T,C)) -> dir(C) = exclusive
+invariant [inv_list_dir_shared] (home_status = pending & home_cmd = req_read_shared & invalidate_list(C)) -> dir(C) = exclusive
+invariant [inv_msg_dir_excl] (home_status = pending & home_cmd = req_read_exclusive & in_chan2(T) & kind_of_msg(T) = rep_invalidate & is_request_from(T,C)) -> dir(C) ~= invalid
+invariant [inv_ack_dir_excl] (home_status = pending & home_cmd = req_read_exclusive & in_chan3(T) & is_request_from(T,C)) -> dir(C) ~= invalid
+invariant [inv_list_dir_excl] (home_status = pending & home_cmd = req_read_exclusive & invalidate_list(C)) -> dir(C) ~= invalid
 
 # home_cmd
 invariant [home_inv_1] home_cmd = nop | home_cmd = req_read_shared | home_cmd = req_read_exclusive 
