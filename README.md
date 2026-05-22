@@ -14,4 +14,8 @@
 | `token_ring_btw_instr.ivy` | Token ring mutex protocol modeled using between relation and witness for token holder | ... | ... | AUTO2 | n/a | Yes | Yes | Yes | No |
 | `ticket.ivy` | Ticket mutex protocol | ... | ... | AUTO5 | n/a | Yes | Yes | Yes | No | 
 | `ticket_ranking.ivy` | Ticket mutex protocol | ... | ... | LEX | n/a | Yes | Yes | Yes | No |
-| `abp.ivy` | Alternating Bit Protocol | ??? | ??? | ??? | Need to figure this out | No | No | No | No |
+| `german_nchan_1.ivy` | German Protocol with n single-capacity channels | ... | ... | LEX | n/a | ? | ? | ? | ? |
+| `german_1chan_n.ivy` | German Protocol with 1 unbounded FIFO channel | ... |... | LEX | n/a | ? | ? | ? | ? |
+| `german_nchan_n.ivy` | German Protocol with n unbounded FIFO channels | ...|... | LEX | n/a | ? | ? | ? | ? |
+| `primary_backup.ivy` | Simple Primary/Backup Protocol|...|...|LEX|n/a|?|?|?|?|
+
