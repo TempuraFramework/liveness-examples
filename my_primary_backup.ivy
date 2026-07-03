@@ -227,6 +227,12 @@ invariant [acked_implies_sent]
 invariant [acking_has_client_reply]
       server_state = acking -> respond_channel(server)
 
+invariant [respond_implies_not_responded]
+      (N ~= server & N ~= client & respond_channel(N)) -> ~responded(N)
+
+invariant [req_replist_iff]
+      (server_state = requesting & N ~= server & N ~= client & ~responded(N)) -> replicate_list(N)
+
 invariant [acking_means_all_sent]
       (server_state = acking & N ~= server & N ~= client) -> ~replicate_list(N)
 
@@ -251,17 +257,44 @@ proof {
   instantiate fair4;
   instantiate fair5;
   tactic ranking with {
-    definition work_created[0](N:node) = true 
-    definition work_needed[0](N:node) = (N~=server & N~=client) & replicate_list(N) & ~responded(N) 
-    definition work_invar[0] = server_state = requesting 
-    definition work_progress[0](N:node) = server_send_replicate_request_fair(N)
-    definition work_helpful[0](N:node) = (N~=server & N~=client) & replicate_list(N) & ~responded(N) & ~request_channel(N)
-    
+    # delta_0 (highest order): backups not yet acked at the server. This ranking
+    # shrinks each time the server consumes a reply,
+    # which happens when server_handle_replicate_ack fires while some backup has a
+    # pending reply on respond_channel. Helpful exactly when such a reply exists.
+    definition work_created[0](N:node) = true
+    definition work_needed[0](N:node)  = (N~=server & N~=client) & ~responded(N)
+    definition work_invar[0]           = server_state = requesting
+    definition work_progress[0](N:node)= server_handle_replicate_ack_fair
+    definition work_helpful[0](N:node) = (N~=server & N~=client) & respond_channel(N)
+
+    # second component: backups that have not yet replied 
+    # reduced when backup_handle_replicate_request
+    # moves a backup from stage b to "replied". Helpful when the request is
+    # in flight to the backup (request_channel set).
     definition work_created[1](N:node) = true
-    definition work_needed[1](N:node) = (N~=server & N~=client) & responded(N) 
-    definition work_invar[1] = server_state = requesting
-    definition work_progress[1](N:node) = backup_handle_replicate_request_fair(N)
-    definition work_helpful[1](N:node) = (N~=server & N~=client) 
+    definition work_needed[1](N:node)  = (N~=server & N~=client) & ~responded(N) & ~respond_channel(N)
+    definition work_invar[1]           = server_state = requesting
+    definition work_progress[1](N:node)= backup_handle_replicate_request_fair(N)
+    definition work_helpful[1](N:node) = (N~=server & N~=client) & request_channel(N)
+
+    # 3rd component: backups that have not yet been sent.
+    # reduced when server_send_replicate_request puts the request in channel.
+    # helpful when the backup is still on the replicate_list and idle on both channels.
+    definition work_created[2](N:node) = true
+    definition work_needed[2](N:node)  = (N~=server & N~=client) & ~responded(N) & ~respond_channel(N) & ~request_channel(N)
+    definition work_invar[2]           = server_state = requesting
+    definition work_progress[2](N:node)= server_send_replicate_request_fair(N)
+    definition work_helpful[2](N:node) = (N~=server & N~=client) & replicate_list(N) & ~responded(N) & ~respond_channel(N) & ~request_channel(N)
+
+    # lowest order: the final step. This ranking is nonempty while
+    # the server is requesting, and emptied when server_handle_replicate_ack
+    # takes the else-branch (all backups responded) and moves to 'acking' = q.
+    # helpful once every backup has responded, so the else-branch is enabled.
+    definition work_created[3](N:node) = true
+    definition work_needed[3](N:node)  = server_state = requesting
+    definition work_invar[3]           = server_state = requesting
+    definition work_progress[3](N:node)= server_handle_replicate_ack_fair
+    definition work_helpful[3](N:node) = forall M. (M~=server & M~=client) -> responded(M)
   }
 }
 
