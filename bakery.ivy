@@ -1,10 +1,11 @@
 #lang ivy 1.8
 
+# Abstract model and proof of liveness of Bakery protocol
+
 include order
 
-# NOTE: In Bakery protocol, both tickets and
-# threads need to be ordered. Each thread has its own thread ID,
-# which we need to perform tie-breaking.
+# both tickets and threads are ordered. Each thread has its own thread ID,
+# which is used for tie-breaking when ticket IDs are the same.
 instance thread : unbounded_sequence
 instance ticket : unbounded_sequence
 
@@ -12,6 +13,11 @@ type location = {idle, picking, waiting, critical}
 
 individual pc(T:thread) : location
 individual number(T:thread) : ticket
+
+# `front` records the thread with the least ticket that is pending.
+# in other words, the `front` thread is the one waiting to enter critical section.
+var has_front : bool
+individual front : thread
 
 ## become_critical(T) whenever T is allowed to enter the critical section.
 # 1. No other thread is in the 'choosing' phase.
@@ -21,6 +27,9 @@ individual number(T:thread) : ticket
 relation lexlt(T1:thread, T2:thread) = # true iff T1 is less than T2 lexicographically.
   number(T2) = 0 | number(T1) < number(T2) | (number(T1)=number(T2) & T1 < T2)
 
+
+# a thread T can take control of the critical section when
+# for all other threads O, (T's number, T's ticket) < (O's number, O's ticket)
 relation become_critical(T:thread) = 
   forall O:thread. O~=T -> lexlt(T, O) #(O ~= T -> (~choosing(O) & lexlt(T,O)))
 
@@ -32,7 +41,8 @@ relation fair_leave_critical(T:thread)
 
 after init {
     pc(T) := idle;
-    number(T) := 0;      
+    number(T) := 0;     
+    has_front := false;
 
     fair_start_picking(T) := false;
     fair_waiting(T) := false;
@@ -51,7 +61,7 @@ action start_picking(t:thread) = {
     }
 }
 
-# Step 2: Finish picking
+# Step 2: Finish picking a ticket n for thread t
 action finish_picking(t:thread, n: ticket) = {
     require n > 0; # enforce positive number
     require forall T:thread. number(T) < n; # We assume we pick a ticket strictly greater than any currently held.
@@ -60,6 +70,10 @@ action finish_picking(t:thread, n: ticket) = {
     fair_waiting(t) := false;
 
     if pc(t) = picking {
+      if ~has_front {
+        front := t; # there's a thread waiting to enter critical section when at least one thread has picked a ticket.
+        has_front := true;
+      };
       number(t) := n;
       pc(t) := waiting;
     }
@@ -83,6 +97,13 @@ action leave(t:thread) = {
     fair_leave_critical(t) := false;
 
     if pc(t) = critical {
+      # Maintain the `front` prophecy variable. Choose the least remaining
+      # live ticket as the new front.
+      if some f:thread. f ~= t & number(f) > 0 minimizing number(f) {
+        front := f;
+      } else {
+        has_front := false;
+      };
       number(t) := 0;
       pc(t) := idle;
     }
@@ -91,13 +112,28 @@ action leave(t:thread) = {
 # Mutex property
 invariant [mutex] (pc(T1) = critical & pc(T2) = critical) -> T1 = T2
 
-# State Consistency
+# supporting invariants
 invariant [valid_ticket] (pc(T) = waiting | pc(T) = critical) -> number(T) > 0
 invariant [no_ticket_idle] (pc(T) = idle | pc(T) = picking) -> number(T) = 0
 
-# The Ordering Invariant 
+# Similar to the ticket protocol here we prove that
+# each thread holds a unique ticket, and `front` is the least-ticket holder. 
+invariant [unique_ticket]
+  (number(T1) > 0 & number(T2) > 0 & number(T1) = number(T2)) -> T1 = T2
+
+invariant [front_number] has_front -> number(front) > 0
+invariant [front_exists] number(T) > 0 -> has_front
+invariant [front_is_least]
+  (has_front & number(T) > 0) -> (front = T | number(front) < number(T))
+
+invariant [pending_threads]
+  number(T) > 0 -> (pc(T) = waiting | pc(T) = critical)
+invariant [critical_thread]
+  pc(T) = critical -> (has_front & T = front)
+invariant [front_critical] has_front -> become_critical(front)
+
 # If T1 is critical, and T2 has a ticket, T1 must be "smaller" than T2.
-invariant [ordering] (pc(T1) = critical & T1 ~= T2 & number(T2) > 0) ->
+invariant [critical_smallest] (pc(T1) = critical & T1 ~= T2 & number(T2) > 0) ->
     (number(T1) < number(T2) | (number(T1) = number(T2) & T1 < T2))
 
 # fairness invariants
@@ -111,12 +147,9 @@ export finish_picking
 export enter
 export leave
 
-################################################################################
-# Liveness Proofs
-################################################################################
+# Liveness
 
-
-# Property: If a thread is waiting, it globally eventually enters critical.
+# If a thread is waiting, it eventually enters critical section subject to assumptions.
 explicit temporal property [starvation_freedom] 
   (
     (forall T. globally eventually fair_start_picking(T)) &
@@ -130,17 +163,19 @@ explicit temporal property [starvation_freedom]
 proof {
   tactic skolemizenp;
   tactic ranking with {
-    definition work_created[0](T:thread) =  lexlt(T, _T) & (number(T) > 0 | pc(T) = picking)
-    definition work_needed[0](T:thread) = pc(T) ~= idle & lexlt(T, _T)
+    # The high-order component is the set of pending threads.
+    definition work_created[0](T:thread) = number(T) > 0
+    definition work_needed[0](T:thread) =
+      number(T) > 0 & (T = _T | lexlt(T, _T))
     definition work_invar[0] = pc(_T) = waiting
-    definition work_progress[0](T:thread) = fair_critical(T)
-    definition work_helpful[0](T:thread) = lexlt(T, _T) & pc(T) = waiting
+    definition work_progress[0](T:thread) = fair_leave_critical(T)
+    definition work_helpful[0](T:thread) = has_front & T = front & pc(T) = critical
 
-    definition work_created[1](T:thread) =  lexlt(T, _T) & (number(T) > 0 | pc(T) = picking)
-    definition work_needed[1](T:thread) = pc(T) = critical & lexlt(T, _T)
+    # The low-order component tracks the thread that's about to enter critical section. 
+    definition work_created[1](T:thread) = has_front & T = front
+    definition work_needed[1](T:thread) = has_front & T = front & pc(T) = waiting
     definition work_invar[1] = pc(_T) = waiting
-    definition work_progress[1](T:thread) = fair_leave_critical(T)
-    definition work_helpful[1](T:thread) = lexlt(T, _T) & pc(T) = critical 
+    definition work_progress[1](T:thread) = fair_critical(T)
+    definition work_helpful[1](T:thread) = has_front & T = front & pc(T) = waiting
   }
 }
-
