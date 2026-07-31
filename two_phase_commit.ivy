@@ -1,0 +1,305 @@
+#lang ivy1.8
+
+## Ivy Model of Two-phase Commit (2PC) Protocol
+#
+# The protocol works as follows:
+# 1. we start with a fixed, ubbounded but finite (N) number of nodes participating in the protocol.
+# 2. one node is marked the 2PC coordinator, and all other nodes are participants.
+# 3. the participants send votes on whether to accept a commit to the coordinator.
+# 3a. if any participant sends a "no" vote, coordinator aborts the commit and sends an abort
+#	message to all 2PC participants via broadcast.
+# 3b. if all participants send a "yes" vote, coordinator accepts the commit (i.e., makes it durable)
+#	and sends the acceptance message to all participants.
+# the coordinator does not participate in the voting process. once a commit is aborted / accepted
+# the protocol ends.
+#
+
+# type describing all nodes. the `finite` modifier tells the liveness tactics that we can
+# assume the set of all nodes is finite for `l2s_work_created`.
+finite type node
+
+# each participant either sends out a `yes` vote or a `no` vote.
+type vote = {yes, no}
+
+# the coordinator starts being in the `undecided` state, and 
+# either chooses `commit` or `abort` based on the decision criterion stated above.
+type decision = {undecided, commit, abort}
+
+# a coordinator is an arbitrary node.
+individual coordinator : node
+
+# any node that isn't the coordinator node is a participant node.
+relation participant(P:node)
+
+# whether a node has its vote recorded 
+relation recorded(P:node)
+
+# whether the coordinator is ready to make a decision
+var decision_ready : bool
+
+# whether all nodes have decided
+var all_decided : bool
+
+### book-keeping for each participant's vote
+# preference(P) prophecies the participant's vote type
+var preference(P:node) : vote
+#  vote_sent(P) toggles to true once P sends its vote to the coordinator
+relation vote_sent(P:node)
+# yes_votes(P) toggles to true if P decides to vote yes
+relation yes_votes(P:node)
+# no_votes(P) toggles to true if P decides to vote no
+relation no_votes(P:node)
+
+### relations representing two message queues  
+# these are used to model transmitting of messages between nodes. 
+#  - vote_msg(S,T,V) means V  was transmitted from S to T, where V is either 'yes' or 'no'.
+#  - decide_msg(S,T,R) means node S sent decision R to node T.
+relation vote_msg(S:node,T:node,V:vote)
+relation decide_msg(S:node,T:node,R:decision)
+
+### Coordinator and participant decisions.
+
+var coordinator_decision : decision
+var local_decision(P:node) : decision
+var broadcast_done : bool
+
+### fairness flags for the liveness proofs
+relation send_vote_fair(P:node)
+relation receive_vote_fair(P:node)
+relation make_decision_fair # coordinator-only fairness condition
+relation send_decide_fair   # coordinator-only fairness condition
+relation receive_decide_fair(P:node)
+
+### Helper definitions
+
+# a participant is any non-coordinator node
+definition participant(P:node) = P ~= coordinator
+
+# a whether a node sent out a vote
+definition recorded(P:node) = yes_votes(P) | no_votes(P)
+
+# either all voted yes or one voted no; in any case a commit may
+# be either made durable or it may be aborted.
+definition decision_ready =
+    (exists P. participant(P) & no_votes(P)) |
+    (forall P. participant(P) -> yes_votes(P))
+definition all_decided =
+    forall P. participant(P) -> local_decision(P) ~= undecided
+
+# The initial states. Note that we leave preference(P) uninitialized,
+# meaning that each node can decide arbitrarily whether it votes yes or no initially.
+after init {
+    vote_sent(P) := false;
+    yes_votes(P) := false;
+    no_votes(P) := false;
+    vote_msg(S,D,V) := false;
+    coordinator_decision := undecided;
+    local_decision(P) := undecided;
+    broadcast_done := false;
+    decide_msg(S,D,R) := false;
+    send_vote_fair(P) := false;
+    receive_vote_fair(P) := false;
+    make_decision_fair := false;
+    send_decide_fair := false;
+    receive_decide_fair(P) := false;
+}
+
+# A participant fixes and sends its preference.
+action participant_send_vote(p:node) = {
+    send_vote_fair(P) := P = p;
+    send_vote_fair(P) := false;
+    if participant(p) & ~vote_sent(p) {
+        vote_msg(p,coordinator,preference(p)) := true;
+        vote_sent(p) := true;
+    }
+}
+
+# The coordinator consumes a vote from participant p and records it.
+action coordinator_receive_vote(p:node) = {
+    receive_vote_fair(P) := P = p;
+    receive_vote_fair(P) := false;
+    if participant(p) {
+        if some v:vote. vote_msg(p,coordinator,v) {
+            vote_msg(p,coordinator,v) := false;
+            if v = yes {
+                yes_votes(p) := true;
+            }
+            else {
+                no_votes(p) := true;
+            }
+        }
+    }
+}
+
+# The coordinator tries to make a decision:
+# A No vote means that we have to abort, whereas a commit is made durable
+# only if a yes vote is recorded from every participant. 
+action coordinator_make_decision = {
+    make_decision_fair := true;
+    make_decision_fair := false;
+    if coordinator_decision = undecided {
+        if some p:node. participant(p) & no_votes(p) {
+            coordinator_decision := abort;
+        }
+        else {
+            if forall P. participant(P) -> yes_votes(P) {
+                coordinator_decision := commit;
+            }
+        }
+    }
+}
+
+# The coordinator broadcasts the decision once enough votes are gathered.
+action coordinator_send_decide = {
+    send_decide_fair := true;
+    send_decide_fair := false;
+    if coordinator_decision ~= undecided & ~broadcast_done {
+        decide_msg(S,D,R) :=
+            S = coordinator & participant(D) & R = coordinator_decision;
+        broadcast_done := true;
+    }
+}
+
+# A participant receives the decision back from coordinator
+action participant_receive_decision(p:node) = {
+    receive_decide_fair(P) := P = p;
+    receive_decide_fair(P) := false;
+    if participant(p) {
+        if some d:decision. decide_msg(coordinator,p,d) {
+            decide_msg(coordinator,p,d) := false;
+            local_decision(p) := d;
+        }
+    }
+}
+
+# Invariants for Safety
+invariant [yes_vote_p]
+    yes_votes(P) ->
+        participant(P) & vote_sent(P) & preference(P) = yes
+
+invariant [no_vote_p]
+    no_votes(P) ->
+        participant(P) & vote_sent(P) & preference(P) = no
+
+invariant [not_both_votes]
+    ~(yes_votes(P) & no_votes(P))
+
+invariant [vote_p]
+    vote_msg(S,D,V) ->
+        participant(S) & D = coordinator & V = preference(S) &
+        vote_sent(S) & ~recorded(S)
+
+invariant [sent_vote_p]
+    participant(P) & vote_sent(P) & ~recorded(P) ->
+        vote_msg(P,coordinator,preference(P))
+
+invariant [commit_requires_all_yes_votes]
+    coordinator_decision = commit ->
+        forall P. participant(P) -> yes_votes(P)
+
+invariant [abort_requires_at_least_one_no_vote]
+    coordinator_decision = abort ->
+        exists P. participant(P) & no_votes(P)
+
+invariant [commit_p]
+    coordinator_decision = commit ->
+        forall P. participant(P) -> preference(P) = yes
+
+invariant [abort_p]
+    coordinator_decision = abort ->
+        exists P. participant(P) & preference(P) = no
+
+invariant [broadcast_decision_p]
+    broadcast_done -> coordinator_decision ~= undecided
+
+invariant [decide_p]
+    decide_msg(S,D,R) ->
+        broadcast_done & S = coordinator & participant(D) &
+        R = coordinator_decision & local_decision(D) = undecided
+
+invariant [undecided_p]
+    broadcast_done & participant(P) & local_decision(P) = undecided ->
+        decide_msg(coordinator,P,coordinator_decision)
+
+invariant [coordinator_not_a_participant]
+    local_decision(coordinator) = undecided
+
+invariant [participant_coordinator_agreement]
+    local_decision(P) ~= undecided ->
+        participant(P) & broadcast_done &
+        local_decision(P) = coordinator_decision
+
+invariant [participant_agreement]
+    local_decision(P) ~= undecided & local_decision(Q) ~= undecided ->
+        local_decision(P) = local_decision(Q)
+
+# Fairness invariants
+invariant [send_vote_signal_transient] ~send_vote_fair(P)
+invariant [receive_vote_signal_transient] ~receive_vote_fair(P)
+invariant [make_decision_signal_transient] ~make_decision_fair
+invariant [send_decide_signal_transient] ~send_decide_fair
+invariant [receive_decide_signal_transient] ~receive_decide_fair(P)
+
+# Liveness Property and its Proof
+
+temporal property [live]
+(
+    (forall P. globally eventually send_vote_fair(P)) &
+    (forall P. globally eventually receive_vote_fair(P)) &
+    (globally eventually make_decision_fair) &
+    (globally eventually send_decide_fair) &
+    (forall P. globally eventually receive_decide_fair(P))
+)
+-> globally (~all_decided -> eventually all_decided)
+proof {
+    tactic skolemizenp;
+    tactic l2s_auto5 with {
+        # Participants that have not yet sent their fixed preference.
+        definition work_created[0](M:node) = true
+        definition work_needed[0](M:node) = participant(M) & ~vote_sent(M)
+        definition work_invar[0] = ~all_decided
+        definition work_progress[0](N:node) = send_vote_fair(N)
+        definition work_helpful[0](N:node) = participant(N) & ~vote_sent(N)
+
+        # Sent votes that the coordinator has not yet recorded.
+        definition work_created[1](M:node) = true
+        definition work_needed[1](M:node) = participant(M) & ~recorded(M)
+        definition work_invar[1] = ~all_decided
+        definition work_progress[1](N:node) = receive_vote_fair(N)
+        definition work_helpful[1](N:node) =
+            participant(N) & exists V. vote_msg(N,coordinator,V)
+
+        # The coordinator's outstanding decision step.
+        definition work_created[2](M:node) = true
+        definition work_needed[2](M:node) =
+            M = coordinator & coordinator_decision = undecided
+        definition work_invar[2] = ~all_decided
+        definition work_progress[2](N:node) = make_decision_fair
+        definition work_helpful[2](N:node) =
+            N = coordinator & coordinator_decision = undecided & decision_ready
+
+        # The outstanding broadcast step. This ranking is present from the
+        # initial state, so making a decision cannot grow it.
+        definition work_created[3](M:node) = true
+        definition work_needed[3](M:node) = M = coordinator & ~broadcast_done
+        definition work_invar[3] = ~all_decided
+        definition work_progress[3](N:node) = send_decide_fair
+        definition work_helpful[3](N:node) = coordinator_decision ~= undecided & ~broadcast_done
+
+        # Participants that have not consumed their DECIDE messages.
+        definition work_created[4](M:node) = true
+        definition work_needed[4](M:node) =
+            participant(M) & local_decision(M) = undecided
+        definition work_invar[4] = ~all_decided
+        definition work_progress[4](N:node) = receive_decide_fair(N)
+        definition work_helpful[4](N:node) =
+            participant(N) & local_decision(N) = undecided &
+            exists R. decide_msg(coordinator,N,R)
+    }
+}
+
+export participant_send_vote
+export coordinator_receive_vote
+export coordinator_make_decision
+export coordinator_send_decide
+export participant_receive_decision
