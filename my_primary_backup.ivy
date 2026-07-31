@@ -256,7 +256,7 @@ proof {
   instantiate fair3;
   instantiate fair4;
   instantiate fair5;
-  tactic ranking with {
+  tactic l2s_auto5 with {
     # delta_0 (highest order): backups not yet acked at the server. This ranking
     # shrinks each time the server consumes a reply,
     # which happens when server_handle_replicate_ack fires while some backup has a

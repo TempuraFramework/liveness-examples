@@ -17,5 +17,5 @@
 | `german_nchan_1.ivy` | German Protocol with n single-capacity channels | ... | ... | LEX | n/a | ? | ? | ? | ? |
 | `german_1chan_n.ivy` | German Protocol with 1 unbounded FIFO channel | ... |... | LEX | n/a | ? | ? | ? | ? |
 | `german_nchan_n.ivy` | German Protocol with n unbounded FIFO channels | ...|... | LEX | n/a | ? | ? | ? | ? |
-| `primary_backup.ivy` | Simple Primary/Backup Protocol|...|...|LEX|n/a|?|?|?|?|
-
+| `my_primary_backup.ivy` | Simple Primary/Backup Protocol|...|...|AUTO5|n/a|Yes|Yes|Yes|No|
+| `two_phsae_commit.ivy` | Two-phase Commit Protocol | ... | ... | AUTO5 | n/a | Yes | Yes | Yes | No |
