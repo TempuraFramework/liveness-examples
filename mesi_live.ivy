@@ -1,0 +1,673 @@
+#lang ivy1.8
+
+# ---------------------------------------------------------------------------
+# MESI cache coherence protocol -- LIVENESS
+#
+#     "every memory access issued by a processor is eventually served"
+#
+#       forall C. globally ( waiting(C) -> eventually ~waiting(C) )
+#
+# The model is `mesi.ivy` (see that file for the protocol itself and for the
+# safety theorem) plus two things:
+#
+#   * fairness instrumentation on every rule of the protocol, and
+#   * FIFO bus arbitration: requests carry a logical timestamp and the
+#     controller starts a transaction for the OLDEST queued request.
+#
+# WHY FIFO ARBITRATION.  With an arbitrary arbiter the property is false
+# under weak fairness: the scheduler must offer `arbitrate` a turn infinitely
+# often, but the arbiter may pick some other queued client every single time,
+# and a cache that keeps requesting can keep the bus busy forever.  There are
+# two honest ways out, and this repository carries both:
+#
+#   mesi_live.ivy             pay in the MODEL     -- FIFO arbitration, and
+#                                                     then weak fairness for
+#                                                     every rule suffices
+#   mesi_live_compassion.ivy  pay in the ASSUMPTION -- arbitrary arbiter, but
+#                                                     assume compassion
+#                                                     (strong fairness) for it
+#
+# Neither implies the other.  This file is the first.
+#
+# The proof is a single lexicographic `ranking` call (Rule 10/11 of McMillan,
+# CAV'24) with twelve components and no auxiliary lemma:
+#
+#   [00]        stage 1: queued requests at least as old as _C's   (highest)
+#   [01]..[03]  stage 3: _C's grant is in flight and must be consumed
+#   [04]..[11]  stage 2: the bus transaction the controller is running (lowest)
+#
+# Two facts about the `ranking` tactic shape everything below.  First, only
+# `l2s_needed_preserved` (conservation) and `l2s_sched_stable` (scheduler
+# stability) are discounted by preemption; `l2s_progress` is not, so every
+# component must reduce its own ranking whenever its scheduler is on --
+# which is why every `work_helpful` below is literally the enabling guard of
+# its rule.  Second, component suffixes are sorted as *strings*, hence two
+# digits.
+#
+# The model here drops the data component (`cdata`/`mem`) of `mesi.ivy`.
+# Data never appears in any guard, so deleting it is a sound abstraction for
+# a progress property: every execution of this model is an execution of
+# `mesi.ivy` with the data projected away, and vice versa.
+# ---------------------------------------------------------------------------
+
+include order
+
+# Logical timestamps ordering the queued requests.
+instance ts : unbounded_sequence
+
+# A fixed but arbitrary number of caches.  Finiteness is what makes the
+# relational rankings below finite (Rule 5), so `work_created = true` is a
+# legitimate finite bound.
+finite type client
+
+type cstate = { invalid , shared , exclusive , modified }      # I, S, E, M
+type creq   = { noreq , busrd , busrdx }
+type dmsg   = { emptyd , snooprd , snooprdx ,
+                grantshared , grantexclusive , grantmodified }
+type umsg   = { emptyu , acknocopy , ackhadcopy }
+
+object s = {
+    var chan_req(C:client)   : creq
+    var chan_snoop(C:client) : dmsg
+    var chan_resp(C:client)  : umsg
+
+    var cache(C:client) : cstate
+
+    var ctl_cmd    : creq
+    var ctl_client : client
+    var ctl_shared : bool
+    var snoop_todo(C:client)  : bool
+    var snoop_await(C:client) : bool
+
+    var waiting(C:client) : bool
+
+    # Timestamp of C's outstanding request; the controller serves the oldest.
+    var reqts(C:client) : ts
+}
+
+# Next timestamp to hand out.
+var clock : ts
+
+# ---------------------------------------------------------------------------
+# Fairness instrumentation.
+#
+# Every rule of the protocol gets a boolean flag pulsed (`:= true; := false;`)
+# in one atomic step, *before* the rule's guard is tested, and the rule body
+# is a guarded command.  So a turn offered to a disabled rule is a stutter
+# step and `globally eventually wf_x` says only "the scheduler offers rule x
+# a turn infinitely often" -- a statement about the SCHEDULER, which is
+# always satisfiable, never about the protocol.  Pulsing the flag inside the
+# guard instead (or using `require`) would silently assume the rule actually
+# runs, and would make the whole property vacuous on executions where the
+# guard never holds.
+#
+# The processor-side rules deliberately get no flag: we never want to force a
+# processor to issue a request, or to force an eviction.
+# ---------------------------------------------------------------------------
+
+var wf_arb        : bool                   # arbitrate
+var wf_sendsnoop(C:client)  : bool         # send_snoop
+var wf_recvresp(C:client)   : bool         # recv_resp
+var wf_complrd    : bool                   # complete_rd
+var wf_complrdx   : bool                   # complete_rdx
+var wf_snoopresp(C:client)  : bool         # snoop_respond
+var wf_recvgs(C:client)     : bool         # recv_grant_shared
+var wf_recvge(C:client)     : bool         # recv_grant_exclusive
+var wf_recvgm(C:client)     : bool         # recv_grant_modified
+
+after init {
+    s.chan_req(C)    := noreq;
+    s.chan_snoop(C)  := emptyd;
+    s.chan_resp(C)   := emptyu;
+    s.cache(C)       := invalid;
+    s.ctl_cmd        := noreq;
+    s.ctl_shared     := false;
+    s.snoop_todo(C)  := false;
+    s.snoop_await(C) := false;
+    s.waiting(C)     := false;
+
+    wf_arb           := false;
+    wf_sendsnoop(C)  := false;
+    wf_recvresp(C)   := false;
+    wf_complrd       := false;
+    wf_complrdx      := false;
+    wf_snoopresp(C)  := false;
+    wf_recvgs(C)     := false;
+    wf_recvge(C)     := false;
+    wf_recvgm(C)     := false;
+
+    s.reqts(C) := 0;
+    clock := 0;
+    clock := clock.next;
+}
+
+# ---------------------------------------------------------------------------
+# Processor side (environment actions, no fairness)
+# ---------------------------------------------------------------------------
+
+action pr_read_miss(cl:client) = {                      # PrRd on I: BusRd
+    require ~s.waiting(cl);
+    require s.cache(cl) = invalid;
+    require s.chan_req(cl) = noreq;
+    s.chan_req(cl) := busrd;
+    s.reqts(cl)    := clock;
+    clock          := clock.next;
+    s.waiting(cl)  := true;
+}
+
+action pr_write_miss(cl:client) = {                     # PrWr on I: BusRdX
+    require ~s.waiting(cl);
+    require s.cache(cl) = invalid;
+    require s.chan_req(cl) = noreq;
+    s.chan_req(cl) := busrdx;
+    s.reqts(cl)    := clock;
+    clock          := clock.next;
+    s.waiting(cl)  := true;
+}
+
+action pr_write_upgrade(cl:client) = {                  # PrWr on S: BusUpgr
+    require ~s.waiting(cl);
+    require s.cache(cl) = shared;
+    require s.chan_req(cl) = noreq;
+    s.chan_req(cl) := busrdx;
+    s.reqts(cl)    := clock;
+    clock          := clock.next;
+    s.waiting(cl)  := true;
+}
+
+# PrWr on E: the silent E -> M upgrade, with no bus transaction at all.
+action pr_write_exclusive(cl:client) = {
+    require s.cache(cl) = exclusive;
+    s.cache(cl) := modified;
+}
+
+action evict(cl:client) = {
+    require s.cache(cl) ~= invalid;
+    s.cache(cl) := invalid;
+}
+
+# ---------------------------------------------------------------------------
+# Bus controller
+# ---------------------------------------------------------------------------
+
+# FIFO arbitration: start a transaction for the OLDEST queued request.  This
+# is the only change to the protocol itself, and it is what replaces
+# compassion.  The rule is unparameterized, so its guard ("the bus is idle
+# and somebody is queued") can only be falsified by the rule itself -- which
+# is exactly why plain weak fairness is enough for it.
+action arbitrate = {
+    wf_arb := true;
+    wf_arb := false;
+    if s.ctl_cmd = noreq {
+        if some cl:client. s.chan_req(cl) ~= noreq minimizing s.reqts(cl) {
+            s.ctl_cmd        := s.chan_req(cl);
+            s.ctl_client     := cl;
+            s.chan_req(cl)   := noreq;
+            s.ctl_shared     := false;
+            s.snoop_todo(C)  := (C ~= cl);
+            s.snoop_await(C) := (C ~= cl);
+        }
+    }
+}
+
+action send_snoop(cl:client) = {
+    wf_sendsnoop(cl) := true;
+    wf_sendsnoop(cl) := false;
+    if s.ctl_cmd ~= noreq & s.snoop_todo(cl) & s.chan_snoop(cl) = emptyd {
+        if s.ctl_cmd = busrd {
+            s.chan_snoop(cl) := snooprd;
+        } else {
+            s.chan_snoop(cl) := snooprdx;
+        };
+        s.snoop_todo(cl) := false;
+    }
+}
+
+action recv_resp(cl:client) = {
+    wf_recvresp(cl) := true;
+    wf_recvresp(cl) := false;
+    if s.ctl_cmd ~= noreq & s.chan_resp(cl) ~= emptyu {
+        if s.chan_resp(cl) = ackhadcopy {
+            s.ctl_shared := true;
+        };
+        s.chan_resp(cl)   := emptyu;
+        s.snoop_await(cl) := false;
+    }
+}
+
+action complete_rd = {
+    wf_complrd := true;
+    wf_complrd := false;
+    if s.ctl_cmd = busrd
+       & (forall I. ~s.snoop_await(I))
+       & s.chan_snoop(s.ctl_client) = emptyd {
+        if s.ctl_shared {
+            s.chan_snoop(s.ctl_client) := grantshared;
+        } else {
+            s.chan_snoop(s.ctl_client) := grantexclusive;
+        };
+        s.ctl_cmd := noreq;
+    }
+}
+
+action complete_rdx = {
+    wf_complrdx := true;
+    wf_complrdx := false;
+    if s.ctl_cmd = busrdx
+       & (forall I. ~s.snoop_await(I))
+       & s.chan_snoop(s.ctl_client) = emptyd {
+        s.chan_snoop(s.ctl_client) := grantmodified;
+        s.ctl_cmd := noreq;
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Client side
+# ---------------------------------------------------------------------------
+
+action snoop_respond(cl:client) = {
+    wf_snoopresp(cl) := true;
+    wf_snoopresp(cl) := false;
+    if s.chan_snoop(cl) = snooprd & s.chan_resp(cl) = emptyu {
+        if s.cache(cl) = invalid {
+            s.chan_resp(cl) := acknocopy;
+        } else {
+            s.chan_resp(cl) := ackhadcopy;
+        };
+        if s.cache(cl) ~= invalid {
+            s.cache(cl) := shared;              # M -> S (flush), E -> S, S -> S
+        };
+        s.chan_snoop(cl) := emptyd;
+    };
+    if s.chan_snoop(cl) = snooprdx & s.chan_resp(cl) = emptyu {
+        if s.cache(cl) = invalid {
+            s.chan_resp(cl) := acknocopy;
+        } else {
+            s.chan_resp(cl) := ackhadcopy;
+        };
+        s.cache(cl)      := invalid;            # M -> I (flush), E/S -> I
+        s.chan_snoop(cl) := emptyd;
+    }
+}
+
+action recv_grant_shared(cl:client) = {
+    wf_recvgs(cl) := true;
+    wf_recvgs(cl) := false;
+    if s.chan_snoop(cl) = grantshared {
+        s.cache(cl)      := shared;
+        s.chan_snoop(cl) := emptyd;
+        s.waiting(cl)    := false;
+    }
+}
+
+action recv_grant_exclusive(cl:client) = {
+    wf_recvge(cl) := true;
+    wf_recvge(cl) := false;
+    if s.chan_snoop(cl) = grantexclusive {
+        s.cache(cl)      := exclusive;
+        s.chan_snoop(cl) := emptyd;
+        s.waiting(cl)    := false;
+    }
+}
+
+action recv_grant_modified(cl:client) = {
+    wf_recvgm(cl) := true;
+    wf_recvgm(cl) := false;
+    if s.chan_snoop(cl) = grantmodified {
+        s.cache(cl)      := modified;
+        s.chan_snoop(cl) := emptyd;
+        s.waiting(cl)    := false;
+    }
+}
+
+export pr_read_miss
+export pr_write_miss
+export pr_write_upgrade
+export pr_write_exclusive
+export evict
+export arbitrate
+export send_snoop
+export recv_resp
+export complete_rd
+export complete_rdx
+export snoop_respond
+export recv_grant_shared
+export recv_grant_exclusive
+export recv_grant_modified
+
+# ---------------------------------------------------------------------------
+# The fairness flags are only momentarily true.
+# ---------------------------------------------------------------------------
+
+invariant ~wf_arb
+invariant ~wf_sendsnoop(C)
+invariant ~wf_recvresp(C)
+invariant ~wf_complrd
+invariant ~wf_complrdx
+invariant ~wf_snoopresp(C)
+invariant ~wf_recvgs(C)
+invariant ~wf_recvge(C)
+invariant ~wf_recvgm(C)
+
+# ---------------------------------------------------------------------------
+# Safety invariants (from mesi.ivy, data-coherence ones omitted)
+# ---------------------------------------------------------------------------
+
+invariant [todo_sub_await]  s.snoop_todo(C) -> s.snoop_await(C)
+invariant [await_busy]      s.snoop_await(C) -> s.ctl_cmd ~= noreq
+invariant [await_not_req]   s.snoop_await(C) -> C ~= s.ctl_client
+
+invariant [resp_awaited]
+    s.chan_resp(C) ~= emptyu ->
+        s.snoop_await(C) & ~s.snoop_todo(C) & s.chan_snoop(C) = emptyd
+
+invariant [snoop_awaited]
+    (s.chan_snoop(C) = snooprd | s.chan_snoop(C) = snooprdx) ->
+        s.snoop_await(C) & ~s.snoop_todo(C)
+
+invariant [snoop_matches_cmd]
+    (s.chan_snoop(C) = snooprd  -> s.ctl_cmd = busrd)
+    & (s.chan_snoop(C) = snooprdx -> s.ctl_cmd = busrdx)
+
+invariant [snoop_in_flight]
+    s.snoop_await(C) & ~s.snoop_todo(C) ->
+        s.chan_snoop(C) = snooprd | s.chan_snoop(C) = snooprdx
+        | s.chan_resp(C) ~= emptyu
+
+invariant [req_chan_free]
+    s.ctl_cmd ~= noreq -> s.chan_snoop(s.ctl_client) = emptyd
+
+invariant [grant_blocks]
+    (s.chan_snoop(C) = grantshared | s.chan_snoop(C) = grantexclusive
+     | s.chan_snoop(C) = grantmodified)
+    & s.ctl_cmd ~= noreq -> s.snoop_await(C)
+
+invariant [one_grant]
+    (s.chan_snoop(C1) = grantshared | s.chan_snoop(C1) = grantexclusive
+     | s.chan_snoop(C1) = grantmodified)
+    & (s.chan_snoop(C2) = grantshared | s.chan_snoop(C2) = grantexclusive
+       | s.chan_snoop(C2) = grantmodified)
+    -> C1 = C2
+
+invariant [waiting_stages]
+    s.waiting(C) <-> (s.chan_req(C) ~= noreq
+                      | (s.ctl_cmd ~= noreq & s.ctl_client = C)
+                      | s.chan_snoop(C) = grantshared
+                      | s.chan_snoop(C) = grantexclusive
+                      | s.chan_snoop(C) = grantmodified)
+
+invariant [stage1_excl]
+    s.chan_req(C) ~= noreq ->
+        ~(s.ctl_cmd ~= noreq & s.ctl_client = C)
+        & s.chan_snoop(C) ~= grantshared
+        & s.chan_snoop(C) ~= grantexclusive
+        & s.chan_snoop(C) ~= grantmodified
+
+# ---------------------------------------------------------------------------
+# MESI COHERENCE (the safety theorem of `mesi.ivy`), carried here so that
+# this file proves coherence and progress of the same model.  Only the
+# data-coherence invariant of `mesi.ivy` is missing, because this model
+# drops the data.
+# ---------------------------------------------------------------------------
+
+# A request is only ever issued from a state that makes it meaningful, and
+# the issuing cache cannot gain a copy while the request is outstanding.
+invariant [rd_requester_invalid]
+    (s.chan_req(C) = busrd | (s.ctl_cmd = busrd & s.ctl_client = C))
+    -> s.cache(C) = invalid
+
+invariant [rdx_requester_clean]
+    (s.chan_req(C) = busrdx | (s.ctl_cmd = busrdx & s.ctl_client = C))
+    -> s.cache(C) = invalid | s.cache(C) = shared
+
+# ---------------------------------------------------------------------------
+# What the snoop responses mean.
+# ---------------------------------------------------------------------------
+
+invariant [nocopy_means_invalid]
+    s.chan_resp(C) = acknocopy -> s.cache(C) = invalid
+
+invariant [rdx_answered_invalid]
+    s.ctl_cmd = busrdx & s.chan_resp(C) ~= emptyu -> s.cache(C) = invalid
+
+invariant [rd_answered_clean]
+    s.ctl_cmd = busrd & s.chan_resp(C) ~= emptyu ->
+        s.cache(C) = invalid | s.cache(C) = shared
+
+# Clients that have already been dealt with in the current transaction.
+invariant [rd_nocopy]
+    s.ctl_cmd = busrd & ~s.ctl_shared & ~s.snoop_await(C) & C ~= s.ctl_client
+    -> s.cache(C) = invalid
+
+invariant [rd_downgraded]
+    s.ctl_cmd = busrd & ~s.snoop_await(C) & C ~= s.ctl_client
+    -> s.cache(C) = invalid | s.cache(C) = shared
+
+invariant [rdx_invalidated]
+    s.ctl_cmd = busrdx & ~s.snoop_await(C) & C ~= s.ctl_client
+    -> s.cache(C) = invalid
+
+# ---------------------------------------------------------------------------
+# What a grant in flight guarantees.
+# ---------------------------------------------------------------------------
+
+invariant [excl_grant_alone]
+    (s.chan_snoop(C1) = grantexclusive | s.chan_snoop(C1) = grantmodified)
+    & C1 ~= C2 -> s.cache(C2) = invalid
+
+invariant [shared_grant_clean]
+    s.chan_snoop(C1) = grantshared
+    -> s.cache(C2) ~= modified & s.cache(C2) ~= exclusive
+
+# ---------------------------------------------------------------------------
+# THE COHERENCE THEOREM
+# ---------------------------------------------------------------------------
+
+# Single writer / multiple reader: an M or E copy is the only copy.
+invariant [swmr]
+    (s.cache(C1) = modified | s.cache(C1) = exclusive) & C1 ~= C2
+    -> s.cache(C2) = invalid
+
+# Two immediate corollaries, stated for the record.
+invariant [at_most_one_modified]
+    s.cache(C1) = modified & s.cache(C2) = modified -> C1 = C2
+
+invariant [modified_excludes_shared]
+    s.cache(C1) = modified & C1 ~= C2 -> s.cache(C2) ~= shared
+
+# Timestamps are handed out in increasing order, so a request issued later is
+# strictly younger than every request already in the system.  This is what
+# makes ranking [00] shrink: a new request can never join it.
+invariant [ts_below_clock] s.reqts(C) < clock
+
+# ---------------------------------------------------------------------------
+# Fairness assumptions: weak fairness (justice) for every rule.
+# ---------------------------------------------------------------------------
+
+explicit temporal axiom [wfa_arb]        globally eventually wf_arb
+explicit temporal axiom [wfa_sendsnoop]  forall C. globally eventually wf_sendsnoop(C)
+explicit temporal axiom [wfa_recvresp]   forall C. globally eventually wf_recvresp(C)
+explicit temporal axiom [wfa_complrd]    globally eventually wf_complrd
+explicit temporal axiom [wfa_complrdx]   globally eventually wf_complrdx
+explicit temporal axiom [wfa_snoopresp]  forall C. globally eventually wf_snoopresp(C)
+explicit temporal axiom [wfa_recvgs]     forall C. globally eventually wf_recvgs(C)
+explicit temporal axiom [wfa_recvge]     forall C. globally eventually wf_recvge(C)
+explicit temporal axiom [wfa_recvgm]     forall C. globally eventually wf_recvgm(C)
+
+# ---------------------------------------------------------------------------
+# THE LIVENESS PROPERTY
+#
+# A waiting client is in exactly one of three stages ([waiting_stages]):
+#
+#   stage 1   chan_req(C) ~= noreq                    request queued
+#   stage 2   ctl_cmd ~= noreq & ctl_client = C       its transaction is running
+#   stage 3   chan_snoop(C) = grant*                  its grant is in flight
+#
+# THE LEXICOGRAPHIC ARGUMENT
+#
+#   [00]  The set of clients whose queued request is at least as old as _C's.
+#         The arbiter always takes the oldest, so every arbitration removes
+#         one of them, and because timestamps only increase a newly issued
+#         request can never join the set.  When the set is empty _C has been
+#         picked.  This is the CAV'24 "pending timestamps <= mine" ranking,
+#         carried over clients rather than over timestamps so that it stays
+#         inside the finite `client` sort.
+#
+#   [01]..[03]  _C consumes its grant and stops waiting.  Three components
+#         because a MESI grant comes in three flavours -- S, E and M -- and
+#         each is consumed by its own rule.
+#
+#   [04]..[11]  The bus transaction currently on the bus must finish.  Its
+#         pipeline is
+#
+#             snoop_todo(N)  --send_snoop-->  snoop in chan_snoop(N)
+#                            --snoop_respond-->  answer in chan_resp(N)
+#                            --recv_resp-->  ~snoop_await(N)
+#
+#         plus the three "stale grant drain" components: a client that still
+#         holds an unconsumed grant BLOCKS the snoop the controller needs to
+#         send it, because snoops and grants share one unit-capacity channel.
+#         Draining that grant is therefore a genuine pipeline stage.  Finally
+#         [10]/[11] fire the completion once every snoop has been answered.
+#
+#         Each pipeline ranking is a SUPERSET of the stages still to come, so
+#         a rule that advances a client from one stage to the next conserves
+#         the rankings of the earlier components while reducing its own.
+#
+# WHY IT MUST BE LEXICOGRAPHIC.  The pipeline rankings [04]..[11] are grown
+# wholesale by `arbitrate`, which happens freely while _C sits in stage 1 or
+# stage 3.  Rule 10 permits that because a preempted ranking may grow.  The
+# preemption is legitimate: `arbitrate` requires an idle bus, and when the
+# bus is idle a waiting _C is in stage 1 or stage 3 by [waiting_stages], so
+# one of [00]..[03] is scheduled at exactly that moment.  Equivalently,
+#
+#     ~pre([04]..[11])  /\  waiting(_C)   ==>   ctl_cmd ~= noreq
+#
+# which is why every pipeline ranking carries the conjunct `ctl_cmd ~= noreq`:
+# it makes each of them empty the instant the bus goes idle.  For [10]/[11]
+# that conjunct IS the ranking and is load bearing; for [04]..[09] it is
+# implied by [await_busy] (`snoop_await(N) -> ctl_cmd ~= noreq`) and so is
+# documentation rather than logic -- deleting it there still verifies.  What
+# is load bearing in every case is the ORDER: demoting [00] or any of
+# [01]..[03] below the pipeline breaks l2s_needed_preserved[04]..[11].
+# ---------------------------------------------------------------------------
+
+explicit temporal property [live]
+  forall C. globally (s.waiting(C) -> eventually ~s.waiting(C))
+proof {
+  tactic skolemizenp;
+  instantiate wfa_arb;
+  instantiate wfa_sendsnoop;
+  instantiate wfa_recvresp;
+  instantiate wfa_complrd;
+  instantiate wfa_complrdx;
+  instantiate wfa_snoopresp;
+  instantiate wfa_recvgs;
+  instantiate wfa_recvge;
+  instantiate wfa_recvgm;
+  tactic ranking with {
+
+    # ===== stage 1: queued requests at least as old as _C's ===============
+    definition work_created[00](N:client) = true
+    definition work_needed[00](N:client)  = s.chan_req(N) ~= noreq
+                                            & s.reqts(N) <= s.reqts(_C)
+    definition work_invar[00]             = s.waiting(_C)
+    definition work_progress[00](N:client)= wf_arb
+    definition work_helpful[00](N:client) = s.ctl_cmd = noreq
+                                            & s.chan_req(_C) ~= noreq
+
+    # ===== stage 3: _C's grant is in flight and must be consumed ==========
+    definition work_created[01](N:client) = true
+    definition work_needed[01](N:client)  = s.waiting(_C)
+    definition work_invar[01]             = s.waiting(_C)
+    definition work_progress[01](N:client)= wf_recvgs(N)
+    definition work_helpful[01](N:client) = N = _C & s.chan_snoop(_C) = grantshared
+
+    definition work_created[02](N:client) = true
+    definition work_needed[02](N:client)  = s.waiting(_C)
+    definition work_invar[02]             = s.waiting(_C)
+    definition work_progress[02](N:client)= wf_recvge(N)
+    definition work_helpful[02](N:client) = N = _C & s.chan_snoop(_C) = grantexclusive
+
+    definition work_created[03](N:client) = true
+    definition work_needed[03](N:client)  = s.waiting(_C)
+    definition work_invar[03]             = s.waiting(_C)
+    definition work_progress[03](N:client)= wf_recvgm(N)
+    definition work_helpful[03](N:client) = N = _C & s.chan_snoop(_C) = grantmodified
+
+    # ===== stage 2: the bus transaction now running =======================
+
+    # [04] the controller collects one snoop response: N leaves the awaited set.
+    definition work_created[04](N:client) = true
+    definition work_needed[04](N:client)  = s.snoop_await(N) & s.ctl_cmd ~= noreq
+    definition work_invar[04]             = s.waiting(_C)
+    definition work_progress[04](N:client)= wf_recvresp(N)
+    definition work_helpful[04](N:client) = s.ctl_cmd ~= noreq
+                                            & s.chan_resp(N) ~= emptyu
+
+    # [05] N processes its snoop and puts the answer in the upward channel.
+    definition work_created[05](N:client) = true
+    definition work_needed[05](N:client)  = s.snoop_await(N) & s.ctl_cmd ~= noreq
+                                            & s.chan_resp(N) = emptyu
+    definition work_invar[05]             = s.waiting(_C)
+    definition work_progress[05](N:client)= wf_snoopresp(N)
+    definition work_helpful[05](N:client) = (s.chan_snoop(N) = snooprd
+                                             | s.chan_snoop(N) = snooprdx)
+                                            & s.chan_resp(N) = emptyu
+
+    # [06] the controller puts N's snoop into the downward channel.
+    definition work_created[06](N:client) = true
+    definition work_needed[06](N:client)  = s.snoop_await(N) & s.ctl_cmd ~= noreq
+                                            & s.chan_resp(N) = emptyu
+                                            & s.chan_snoop(N) ~= snooprd
+                                            & s.chan_snoop(N) ~= snooprdx
+    definition work_invar[06]             = s.waiting(_C)
+    definition work_progress[06](N:client)= wf_sendsnoop(N)
+    definition work_helpful[06](N:client) = s.ctl_cmd ~= noreq
+                                            & s.snoop_todo(N)
+                                            & s.chan_snoop(N) = emptyd
+
+    # [07]..[09] N drains a stale grant, freeing its channel for the snoop.
+    definition work_created[07](N:client) = true
+    definition work_needed[07](N:client)  = s.snoop_await(N) & s.ctl_cmd ~= noreq
+                                            & s.chan_snoop(N) = grantshared
+    definition work_invar[07]             = s.waiting(_C)
+    definition work_progress[07](N:client)= wf_recvgs(N)
+    definition work_helpful[07](N:client) = s.ctl_cmd ~= noreq & s.snoop_await(N)
+                                            & s.chan_snoop(N) = grantshared
+
+    definition work_created[08](N:client) = true
+    definition work_needed[08](N:client)  = s.snoop_await(N) & s.ctl_cmd ~= noreq
+                                            & s.chan_snoop(N) = grantexclusive
+    definition work_invar[08]             = s.waiting(_C)
+    definition work_progress[08](N:client)= wf_recvge(N)
+    definition work_helpful[08](N:client) = s.ctl_cmd ~= noreq & s.snoop_await(N)
+                                            & s.chan_snoop(N) = grantexclusive
+
+    definition work_created[09](N:client) = true
+    definition work_needed[09](N:client)  = s.snoop_await(N) & s.ctl_cmd ~= noreq
+                                            & s.chan_snoop(N) = grantmodified
+    definition work_invar[09]             = s.waiting(_C)
+    definition work_progress[09](N:client)= wf_recvgm(N)
+    definition work_helpful[09](N:client) = s.ctl_cmd ~= noreq & s.snoop_await(N)
+                                            & s.chan_snoop(N) = grantmodified
+
+    # [10] every snoop answered: the controller answers a BusRd.
+    definition work_created[10](N:client) = true
+    definition work_needed[10](N:client)  = s.ctl_cmd ~= noreq
+    definition work_invar[10]             = s.waiting(_C)
+    definition work_progress[10](N:client)= wf_complrd
+    definition work_helpful[10](N:client) = s.ctl_cmd = busrd
+                                            & (forall I. ~s.snoop_await(I))
+                                            & s.chan_snoop(s.ctl_client) = emptyd
+
+    # [11] every snoop answered: the controller answers a BusRdX.
+    definition work_created[11](N:client) = true
+    definition work_needed[11](N:client)  = s.ctl_cmd ~= noreq
+    definition work_invar[11]             = s.waiting(_C)
+    definition work_progress[11](N:client)= wf_complrdx
+    definition work_helpful[11](N:client) = s.ctl_cmd = busrdx
+                                            & (forall I. ~s.snoop_await(I))
+                                            & s.chan_snoop(s.ctl_client) = emptyd
+  }
+}

@@ -1,0 +1,478 @@
+#lang ivy1.8
+
+# ---------------------------------------------------------------------------
+# The MESI cache coherence protocol  --  safety model
+# (https://en.wikipedia.org/wiki/MESI_protocol)
+#
+# Every cache line in every cache is in one of four states:
+#
+#   M (modified)   dirty, and this is the ONLY copy in the system
+#   E (exclusive)  clean, and this is the ONLY copy in the system
+#   S (shared)     clean, other caches may hold the line too
+#   I (invalid)    no copy
+#
+# The processor side of the MESI table:
+#
+#   PrRd  on I  ->  issue BusRd.   Land in S if somebody else had a copy,
+#                                  in E if nobody did.   <-- the "E" of MESI
+#   PrRd  on S/E/M                 hit, no bus transaction, no state change
+#   PrWr  on I  ->  issue BusRdX.  Land in M; everybody else -> I
+#   PrWr  on S  ->  issue BusUpgr. Land in M; everybody else -> I
+#   PrWr  on E  ->  SILENT upgrade E -> M, no bus transaction whatsoever
+#                                  <-- the whole point of having an E state
+#   PrWr  on M                     hit, no bus transaction, no state change
+#
+# The snoop side of the MESI table:
+#
+#   BusRd  seen in M -> Flush (write back), go to S,  assert the shared line
+#   BusRd  seen in E -> go to S,                      assert the shared line
+#   BusRd  seen in S -> stay S,                       assert the shared line
+#   BusRd  seen in I -> stay I,                       do not assert it
+#   BusRdX seen in M -> Flush (write back), go to I,  assert the shared line
+#   BusRdX seen in E/S -> go to I,                    assert the shared line
+#   BusRdX seen in I -> stay I
+#
+# MODELLING DECISIONS
+#
+# 1.  Split-transaction bus.  A real snooping bus performs a transaction
+#     atomically; that would make every interesting concurrency question
+#     disappear.  Here the bus controller is a separate process and the
+#     transaction is a *pipeline*:
+#
+#       arbitrate  ->  send a snoop to every other cache  ->  each cache
+#       processes its snoop and answers  ->  the controller collects the
+#       answers  ->  the controller grants the line to the requester
+#
+#     Each leg travels in its own unit-capacity channel, exactly as in the
+#     German protocol model (`german_3channels_*.ivy`):
+#
+#       chan_req(C)   : client     -> controller   busrd | busrdx
+#       chan_snoop(C) : controller -> client       snoops AND grants
+#       chan_resp(C)  : client     -> controller   snoop responses
+#
+#     Note that snoops and grants share one channel, as they do on a real
+#     bus: this is what serialises the protocol and it is load bearing for
+#     safety (see [grant_blocks] and [one_grant] below).
+#
+# 2.  No directory.  This is a *snooping* protocol, so the controller keeps
+#     no sharer list.  It broadcasts to every cache except the requester and
+#     learns who holds a copy from the responses.  `ctl_shared` is the MESI
+#     "shared line": the OR of the snoop responses.  It is what decides
+#     between granting E and granting S -- the defining MESI mechanism.
+#
+# 3.  BusRdX and BusUpgr are the same message here.  They differ only in
+#     whether the requester needs the data, and the coherence state machine
+#     cannot tell them apart.
+#
+# 4.  A client blocks until its outstanding request is answered (the ghost
+#     bit `waiting`).  This is the standard modelling assumption; it is what
+#     makes "a request receives a response" a well posed obligation in
+#     `mesi_live.ivy`.
+#
+# THE SAFETY THEOREM is the pair
+#
+#   [swmr]      single writer / multiple reader: an M or E copy is the only
+#               copy in the system
+#   [data_coh]  every clean valid copy holds the current memory value
+#
+# which together are exactly "the caches are coherent".
+# ---------------------------------------------------------------------------
+
+finite type client
+type value
+
+type cstate = { invalid , shared , exclusive , modified }      # I, S, E, M
+type creq   = { noreq , busrd , busrdx }                       # bus requests
+type dmsg   = { emptyd , snooprd , snooprdx ,                  # downward channel
+                grantshared , grantexclusive , grantmodified }
+type umsg   = { emptyu , acknocopy , ackhadcopy }              # upward channel
+
+object s = {
+    # ---- the three unit-capacity channels per client ----
+    var chan_req(C:client)   : creq
+    var chan_snoop(C:client) : dmsg
+    var chan_resp(C:client)  : umsg
+
+    # ---- cache contents ----
+    var cache(C:client) : cstate
+    var cdata(C:client) : value
+    var mem : value
+
+    # ---- bus controller state (per transaction; there is no directory) ----
+    var ctl_cmd    : creq        # noreq  <=>  the bus is idle
+    var ctl_client : client      # the requester of the current transaction
+    var ctl_shared : bool        # the MESI shared line: somebody has a copy
+    var snoop_todo(C:client)  : bool   # C has not been sent its snoop yet
+    var snoop_await(C:client) : bool   # C's response has not come back yet
+
+    # ---- ghost ----
+    var waiting(C:client) : bool # C has an unanswered request outstanding
+}
+
+after init {
+    s.chan_req(C)    := noreq;
+    s.chan_snoop(C)  := emptyd;
+    s.chan_resp(C)   := emptyu;
+    s.cache(C)       := invalid;
+    s.cdata(C)       := s.mem;
+    s.ctl_cmd        := noreq;
+    s.ctl_shared     := false;
+    s.snoop_todo(C)  := false;
+    s.snoop_await(C) := false;
+    s.waiting(C)     := false;
+}
+
+# ---------------------------------------------------------------------------
+# Processor side.  These are environment actions: we never want to force a
+# processor to issue a request, so they keep `require` guards and get no
+# fairness assumption in `mesi_live.ivy`.
+#
+# PrRd on S/E/M and PrWr on M change nothing at all and are therefore not
+# modelled as separate actions (a read hit is a no-op on the state).
+# ---------------------------------------------------------------------------
+
+# PrRd miss.  I --BusRd--> S or E, depending on the shared line.
+action pr_read_miss(cl:client) = {
+    require ~s.waiting(cl);
+    require s.cache(cl) = invalid;
+    require s.chan_req(cl) = noreq;
+    s.chan_req(cl) := busrd;
+    s.waiting(cl)  := true;
+}
+
+# PrWr miss.  I --BusRdX--> M.
+action pr_write_miss(cl:client) = {
+    require ~s.waiting(cl);
+    require s.cache(cl) = invalid;
+    require s.chan_req(cl) = noreq;
+    s.chan_req(cl) := busrdx;
+    s.waiting(cl)  := true;
+}
+
+# PrWr on a shared line.  S --BusUpgr--> M.
+action pr_write_upgrade(cl:client) = {
+    require ~s.waiting(cl);
+    require s.cache(cl) = shared;
+    require s.chan_req(cl) = noreq;
+    s.chan_req(cl) := busrdx;
+    s.waiting(cl)  := true;
+}
+
+# PrWr on an exclusive line.  E --> M with NO bus transaction.  This is the
+# MESI optimisation over MSI and the reason the E state exists.
+action pr_write_exclusive(cl:client, v:value) = {
+    require s.cache(cl) = exclusive;
+    s.cache(cl) := modified;
+    s.cdata(cl) := v;
+}
+
+# PrWr on a modified line: a plain local hit.
+action pr_write_modified(cl:client, v:value) = {
+    require s.cache(cl) = modified;
+    s.cdata(cl) := v;
+}
+
+# A cache may drop a line at any time; a dirty line is written back first.
+action evict(cl:client) = {
+    require s.cache(cl) ~= invalid;
+    if s.cache(cl) = modified {
+        s.mem := s.cdata(cl);
+    };
+    s.cache(cl) := invalid;
+}
+
+# ---------------------------------------------------------------------------
+# Bus controller
+# ---------------------------------------------------------------------------
+
+# Arbitration: start a transaction for one pending request and schedule a
+# snoop to every *other* cache.  (Broadcast: the controller has no directory
+# and so does not know who holds the line.)
+action arbitrate = {
+    if s.ctl_cmd = noreq {
+        if some cl:client. s.chan_req(cl) ~= noreq {
+            s.ctl_cmd        := s.chan_req(cl);
+            s.ctl_client     := cl;
+            s.chan_req(cl)   := noreq;
+            s.ctl_shared     := false;
+            s.snoop_todo(C)  := (C ~= cl);
+            s.snoop_await(C) := (C ~= cl);
+        }
+    }
+}
+
+# Put the snoop for the current transaction into C's downward channel.
+action send_snoop(cl:client) = {
+    if s.ctl_cmd ~= noreq & s.snoop_todo(cl) & s.chan_snoop(cl) = emptyd {
+        if s.ctl_cmd = busrd {
+            s.chan_snoop(cl) := snooprd;
+        } else {
+            s.chan_snoop(cl) := snooprdx;
+        };
+        s.snoop_todo(cl) := false;
+    }
+}
+
+# Collect one snoop response; `ackhadcopy` asserts the shared line.
+action recv_resp(cl:client) = {
+    if s.ctl_cmd ~= noreq & s.chan_resp(cl) ~= emptyu {
+        if s.chan_resp(cl) = ackhadcopy {
+            s.ctl_shared := true;
+        };
+        s.chan_resp(cl)   := emptyu;
+        s.snoop_await(cl) := false;
+    }
+}
+
+# All snoops answered: answer a BusRd.  Grant E if nobody else had a copy,
+# S otherwise.  THIS IS THE MESI DECISION.
+action complete_rd = {
+    if s.ctl_cmd = busrd
+       & (forall I. ~s.snoop_await(I))
+       & s.chan_snoop(s.ctl_client) = emptyd {
+        if s.ctl_shared {
+            s.chan_snoop(s.ctl_client) := grantshared;
+        } else {
+            s.chan_snoop(s.ctl_client) := grantexclusive;
+        };
+        s.ctl_cmd := noreq;
+    }
+}
+
+# All snoops answered: answer a BusRdX / BusUpgr.  Everybody else is in I by
+# now, so the requester may go straight to M.
+action complete_rdx = {
+    if s.ctl_cmd = busrdx
+       & (forall I. ~s.snoop_await(I))
+       & s.chan_snoop(s.ctl_client) = emptyd {
+        s.chan_snoop(s.ctl_client) := grantmodified;
+        s.ctl_cmd := noreq;
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Client side: snoop handling and grant reception
+# ---------------------------------------------------------------------------
+
+# Process the snoop sitting in the downward channel and answer it.  The two
+# `if`s are mutually exclusive: the first clears `chan_snoop`.
+action snoop_respond(cl:client) = {
+    # --- BusRd snooped: M -> S (flush), E -> S, S -> S, I -> I ---
+    if s.chan_snoop(cl) = snooprd & s.chan_resp(cl) = emptyu {
+        if s.cache(cl) = invalid {
+            s.chan_resp(cl) := acknocopy;
+        } else {
+            s.chan_resp(cl) := ackhadcopy;
+        };
+        if s.cache(cl) = modified {
+            s.mem := s.cdata(cl);               # Flush
+        };
+        if s.cache(cl) ~= invalid {
+            s.cache(cl) := shared;
+        };
+        s.chan_snoop(cl) := emptyd;
+    };
+    # --- BusRdX snooped: M -> I (flush), E -> I, S -> I, I -> I ---
+    if s.chan_snoop(cl) = snooprdx & s.chan_resp(cl) = emptyu {
+        if s.cache(cl) = invalid {
+            s.chan_resp(cl) := acknocopy;
+        } else {
+            s.chan_resp(cl) := ackhadcopy;
+        };
+        if s.cache(cl) = modified {
+            s.mem := s.cdata(cl);               # Flush
+        };
+        s.cache(cl)      := invalid;
+        s.chan_snoop(cl) := emptyd;
+    }
+}
+
+action recv_grant_shared(cl:client) = {
+    if s.chan_snoop(cl) = grantshared {
+        s.cache(cl)      := shared;
+        s.cdata(cl)      := s.mem;
+        s.chan_snoop(cl) := emptyd;
+        s.waiting(cl)    := false;
+    }
+}
+
+action recv_grant_exclusive(cl:client) = {
+    if s.chan_snoop(cl) = grantexclusive {
+        s.cache(cl)      := exclusive;
+        s.cdata(cl)      := s.mem;
+        s.chan_snoop(cl) := emptyd;
+        s.waiting(cl)    := false;
+    }
+}
+
+action recv_grant_modified(cl:client) = {
+    if s.chan_snoop(cl) = grantmodified {
+        s.cache(cl)      := modified;
+        s.cdata(cl)      := s.mem;
+        s.chan_snoop(cl) := emptyd;
+        s.waiting(cl)    := false;
+    }
+}
+
+export pr_read_miss
+export pr_write_miss
+export pr_write_upgrade
+export pr_write_exclusive
+export pr_write_modified
+export evict
+export arbitrate
+export send_snoop
+export recv_resp
+export complete_rd
+export complete_rdx
+export snoop_respond
+export recv_grant_shared
+export recv_grant_exclusive
+export recv_grant_modified
+
+# ===========================================================================
+# INVARIANTS
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# A. Well-formedness of the transaction bookkeeping.
+# ---------------------------------------------------------------------------
+
+invariant [todo_sub_await]  s.snoop_todo(C) -> s.snoop_await(C)
+invariant [await_busy]      s.snoop_await(C) -> s.ctl_cmd ~= noreq
+invariant [await_not_req]   s.snoop_await(C) -> C ~= s.ctl_client
+
+# A response in the upward channel belongs to the current transaction, and
+# the corresponding downward channel is empty (the client emptied it when it
+# answered, and nothing may refill it).
+invariant [resp_awaited]
+    s.chan_resp(C) ~= emptyu ->
+        s.snoop_await(C) & ~s.snoop_todo(C) & s.chan_snoop(C) = emptyd
+
+invariant [snoop_awaited]
+    (s.chan_snoop(C) = snooprd | s.chan_snoop(C) = snooprdx) ->
+        s.snoop_await(C) & ~s.snoop_todo(C)
+
+invariant [snoop_matches_cmd]
+    (s.chan_snoop(C) = snooprd  -> s.ctl_cmd = busrd)
+    & (s.chan_snoop(C) = snooprdx -> s.ctl_cmd = busrdx)
+
+# Nobody is "stuck outside the pipeline": an awaited client whose snoop has
+# already been sent has it either in the downward channel, or has answered
+# and the answer is in the upward channel.  (The MESI analogue of German's
+# [inv_in_flight]; it is what discharges the "something is scheduled"
+# premise of the liveness proof.)
+invariant [snoop_in_flight]
+    s.snoop_await(C) & ~s.snoop_todo(C) ->
+        s.chan_snoop(C) = snooprd | s.chan_snoop(C) = snooprdx
+        | s.chan_resp(C) ~= emptyu
+
+# The requester's downward channel is kept free for its grant.
+invariant [req_chan_free]
+    s.ctl_cmd ~= noreq -> s.chan_snoop(s.ctl_client) = emptyd
+
+# THE SERIALISATION FACT.  A client holding an undelivered grant cannot have
+# been snooped away by a later transaction, so that transaction cannot
+# finish until the grant is consumed.  Everything about exclusivity rests on
+# this.
+invariant [grant_blocks]
+    (s.chan_snoop(C) = grantshared | s.chan_snoop(C) = grantexclusive
+     | s.chan_snoop(C) = grantmodified)
+    & s.ctl_cmd ~= noreq -> s.snoop_await(C)
+
+# Consequently at most one grant is in flight at a time.
+invariant [one_grant]
+    (s.chan_snoop(C1) = grantshared | s.chan_snoop(C1) = grantexclusive
+     | s.chan_snoop(C1) = grantmodified)
+    & (s.chan_snoop(C2) = grantshared | s.chan_snoop(C2) = grantexclusive
+       | s.chan_snoop(C2) = grantmodified)
+    -> C1 = C2
+
+# ---------------------------------------------------------------------------
+# B. The three stages of an outstanding request.
+# ---------------------------------------------------------------------------
+
+invariant [waiting_stages]
+    s.waiting(C) <-> (s.chan_req(C) ~= noreq
+                      | (s.ctl_cmd ~= noreq & s.ctl_client = C)
+                      | s.chan_snoop(C) = grantshared
+                      | s.chan_snoop(C) = grantexclusive
+                      | s.chan_snoop(C) = grantmodified)
+
+invariant [stage1_excl]
+    s.chan_req(C) ~= noreq ->
+        ~(s.ctl_cmd ~= noreq & s.ctl_client = C)
+        & s.chan_snoop(C) ~= grantshared
+        & s.chan_snoop(C) ~= grantexclusive
+        & s.chan_snoop(C) ~= grantmodified
+
+# A request is only ever issued from a state that makes it meaningful, and
+# the issuing cache cannot gain a copy while the request is outstanding.
+invariant [rd_requester_invalid]
+    (s.chan_req(C) = busrd | (s.ctl_cmd = busrd & s.ctl_client = C))
+    -> s.cache(C) = invalid
+
+invariant [rdx_requester_clean]
+    (s.chan_req(C) = busrdx | (s.ctl_cmd = busrdx & s.ctl_client = C))
+    -> s.cache(C) = invalid | s.cache(C) = shared
+
+# ---------------------------------------------------------------------------
+# C. What the snoop responses mean.
+# ---------------------------------------------------------------------------
+
+invariant [nocopy_means_invalid]
+    s.chan_resp(C) = acknocopy -> s.cache(C) = invalid
+
+invariant [rdx_answered_invalid]
+    s.ctl_cmd = busrdx & s.chan_resp(C) ~= emptyu -> s.cache(C) = invalid
+
+invariant [rd_answered_clean]
+    s.ctl_cmd = busrd & s.chan_resp(C) ~= emptyu ->
+        s.cache(C) = invalid | s.cache(C) = shared
+
+# Clients that have already been dealt with in the current transaction.
+invariant [rd_nocopy]
+    s.ctl_cmd = busrd & ~s.ctl_shared & ~s.snoop_await(C) & C ~= s.ctl_client
+    -> s.cache(C) = invalid
+
+invariant [rd_downgraded]
+    s.ctl_cmd = busrd & ~s.snoop_await(C) & C ~= s.ctl_client
+    -> s.cache(C) = invalid | s.cache(C) = shared
+
+invariant [rdx_invalidated]
+    s.ctl_cmd = busrdx & ~s.snoop_await(C) & C ~= s.ctl_client
+    -> s.cache(C) = invalid
+
+# ---------------------------------------------------------------------------
+# D. What a grant in flight guarantees.
+# ---------------------------------------------------------------------------
+
+invariant [excl_grant_alone]
+    (s.chan_snoop(C1) = grantexclusive | s.chan_snoop(C1) = grantmodified)
+    & C1 ~= C2 -> s.cache(C2) = invalid
+
+invariant [shared_grant_clean]
+    s.chan_snoop(C1) = grantshared
+    -> s.cache(C2) ~= modified & s.cache(C2) ~= exclusive
+
+# ---------------------------------------------------------------------------
+# E. THE SAFETY THEOREM
+# ---------------------------------------------------------------------------
+
+# Single writer / multiple reader: an M or E copy is the only copy.
+invariant [swmr]
+    (s.cache(C1) = modified | s.cache(C1) = exclusive) & C1 ~= C2
+    -> s.cache(C2) = invalid
+
+# Two immediate corollaries, stated for the record.
+invariant [at_most_one_modified]
+    s.cache(C1) = modified & s.cache(C2) = modified -> C1 = C2
+
+invariant [modified_excludes_shared]
+    s.cache(C1) = modified & C1 ~= C2 -> s.cache(C2) ~= shared
+
+# Data coherence: every clean valid copy agrees with memory.  (A modified
+# copy is allowed to differ -- that is what "dirty" means -- and it is
+# flushed back before anybody else may observe the line.)
+invariant [data_coh]
+    (s.cache(C) = shared | s.cache(C) = exclusive) -> s.cdata(C) = s.mem

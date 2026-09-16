@@ -1,0 +1,377 @@
+#lang ivy1.8
+
+# ===========================================================================
+# The MOESI cache coherence protocol -- directory based, one home directory,
+# an arbitrary finite number of caches ("clients"), three unit-capacity
+# channels per client.
+#
+#   channel1  : client -> home   requests            (reqshared / reqexclusive)
+#   channel2_4: home   -> client probes + grants
+#   channel3  : client -> home   probe acknowledgements
+#
+# This is the *safety* model.  `moesi_live.ivy` adds fairness instrumentation
+# and the liveness proof.
+#
+# ---------------------------------------------------------------------------
+# WHAT MOESI IS (https://en.wikipedia.org/wiki/MOESI_protocol)
+#
+# Every cache line in every cache is in one of five states:
+#
+#   M  Modified   the only valid copy; dirty w.r.t. memory; writable
+#   O  Owned      one of several valid copies; dirty w.r.t. memory; this cache
+#                 is responsible for supplying the data and for the writeback;
+#                 not writable without first invalidating the sharers
+#   E  Exclusive  the only valid copy; clean; writable (silently, E -> M)
+#   S  Shared     one of several valid copies; not writable
+#   I  Invalid    no copy
+#
+# The compatibility table (which pairs of states may be held simultaneously by
+# two *different* caches) is
+#
+#         M   O   E   S   I
+#     M   -   -   -   -   x
+#     O   -   -   -   x   x
+#     E   -   -   -   -   x
+#     S   -   x   -   x   x
+#     I   x   x   x   x   x
+#
+# and it is exactly what the four `moesi_*` invariants below assert.  It is
+# the safety property of the protocol.
+#
+# MOESI = MESI + the O state.  The point of O is *dirty sharing*: when a cache
+# holding a line in M sees a read by another cache, MESI must write the line
+# back to memory (M -> S, memory updated); MOESI instead moves M -> O and lets
+# the owner keep the dirty data and answer future reads, with no writeback.
+# In this model that is the `downgrade` probe:
+#
+#     M --downgrade--> O          (dirty: the data stays in the cache)
+#     E --downgrade--> S          (clean: nothing to keep)
+#
+# The E state is the other optimisation MOESI inherits from MESI: a read miss
+# that finds *no* other copy is answered with E rather than S, so the reader
+# can later upgrade to M silently (`writeExclusiveRule`) with no bus traffic.
+#
+# ---------------------------------------------------------------------------
+# THE DIRECTORY
+#
+# The home directory keeps
+#
+#   homeSharerList(C)     C holds a valid copy (S, O, E or M)
+#   homeexclusiveGranted  some cache holds the line writable (E or M)
+#   owner                 which cache that is -- and, after a downgrade, which
+#                         cache holds the line in O
+#   homeCurrentCommand    the request being served right now (empty1 = idle)
+#   homeCurrentclient     who issued it
+#   homeprobeList(C)      C still has to be probed for the current command
+#
+# Serving one request is a little pipeline:
+#
+#   pick  --> probe every cache on the probe list --> collect the acks
+#         --> grant
+#
+# where "probe" is `invalidate` for a write request (reqexclusive) and
+# `downgrade` for a read request (reqshared) that finds the line writable
+# somewhere.  Because `homeexclusiveGranted -> homeSharerList(C) -> C = owner`,
+# the downgrade probe list is automatically the singleton {owner}.
+# ===========================================================================
+
+type client
+
+type message1    = { empty1 , reqshared , reqexclusive }
+type message2_4  = { empty2_4 , invalidate , downgrade ,
+                     grantshared , grantexclusive , grantmodified }
+type message3    = { empty3 , invalidateAck , downgradeAck }
+type cachestate  = { invalid , shared , owned , exclusive , modified }
+
+object s = {
+    var channel1(C:client)   : message1
+    var channel2_4(C:client) : message2_4
+    var channel3(C:client)   : message3
+    var cache(C:client)      : cachestate
+
+    var homeSharerList(C:client)  : bool
+    var homeprobeList(C:client)   : bool
+    var homeexclusiveGranted      : bool
+    var homeCurrentCommand        : message1
+    var homeCurrentclient         : client
+}
+
+# Witness for "the cache that holds the line writable, or owns the dirty copy".
+var owner : client
+
+after init {
+    s.channel1(C)   := empty1;
+    s.channel2_4(C) := empty2_4;
+    s.channel3(C)   := empty3;
+    s.cache(C)      := invalid;
+    s.homeSharerList(C) := false;
+    s.homeprobeList(C)  := false;
+    s.homeexclusiveGranted := false;
+    s.homeCurrentCommand   := empty1;
+}
+
+# ---------------------------------------------------------------------------
+# Client-side request generation
+# ---------------------------------------------------------------------------
+
+# Read miss.
+action reqsharedRule(cl:client) = {
+    require s.cache(cl) = invalid & s.channel1(cl) = empty1;
+    s.channel1(cl) := reqshared;
+}
+
+# Write miss, or an upgrade out of S or O.
+action reqexclusiveRule(cl:client) = {
+    require (s.cache(cl) = invalid | s.cache(cl) = shared | s.cache(cl) = owned)
+            & s.channel1(cl) = empty1;
+    s.channel1(cl) := reqexclusive;
+}
+
+# MESI/MOESI silent upgrade: the holder of the only clean copy may write it
+# without telling anybody -- the directory already records write permission.
+action writeExclusiveRule(cl:client) = {
+    require s.cache(cl) = exclusive;
+    s.cache(cl) := modified;
+}
+
+# ---------------------------------------------------------------------------
+# Home directory: accept a request and compute its probe list
+# ---------------------------------------------------------------------------
+
+action pickNewRequestRule(cl:client) = {
+    require s.homeCurrentCommand = empty1 & s.channel1(cl) ~= empty1;
+    s.homeCurrentCommand := s.channel1(cl);
+    s.channel1(cl) := empty1;
+    s.homeCurrentclient := cl;
+    # Re-snapshot the probe list.  `homeSharerList` cannot grow while a
+    # command is in progress (only the grant rules write it, and they all end
+    # the command), so this snapshot stays complete for the whole command.
+    s.homeprobeList(C) := s.homeSharerList(C);
+}
+
+# ---------------------------------------------------------------------------
+# Home directory: probes
+# ---------------------------------------------------------------------------
+
+# Write request: every cache with a copy must drop it.
+action sendinvalidateRule(cl:client) = {
+    require s.channel2_4(cl) = empty2_4 & s.homeprobeList(cl)
+            & s.homeCurrentCommand = reqexclusive;
+    s.channel2_4(cl) := invalidate;
+    s.homeprobeList(cl) := false;
+}
+
+# Read request that finds the line writable somewhere: the owner must give up
+# write permission, but *keeps the data* (M -> O, or E -> S).  This is the
+# transition that distinguishes MOESI from MESI.
+action senddowngradeRule(cl:client) = {
+    require s.channel2_4(cl) = empty2_4 & s.homeprobeList(cl)
+            & s.homeCurrentCommand = reqshared & s.homeexclusiveGranted;
+    s.channel2_4(cl) := downgrade;
+    s.homeprobeList(cl) := false;
+}
+
+# ---------------------------------------------------------------------------
+# Client-side probe handling
+# ---------------------------------------------------------------------------
+
+action clientinvalidatesRule(cl:client) = {
+    require s.channel2_4(cl) = invalidate & s.channel3(cl) = empty3;
+    s.channel2_4(cl) := empty2_4;
+    s.channel3(cl)   := invalidateAck;
+    s.cache(cl)      := invalid;
+}
+
+action clientdowngradesRule(cl:client) = {
+    require s.channel2_4(cl) = downgrade & s.channel3(cl) = empty3;
+    s.channel2_4(cl) := empty2_4;
+    s.channel3(cl)   := downgradeAck;
+    if s.cache(cl) = modified {
+        s.cache(cl) := owned;          # dirty sharing: no writeback
+    } else if s.cache(cl) = exclusive {
+        s.cache(cl) := shared;         # clean
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Home directory: collect acknowledgements
+# ---------------------------------------------------------------------------
+
+action receiveinvalidateAckRule(cl:client) = {
+    require s.homeCurrentCommand ~= empty1 & s.channel3(cl) = invalidateAck;
+    s.homeSharerList(cl) := false;
+    s.homeexclusiveGranted := false;
+    s.channel3(cl) := empty3;
+}
+
+action receivedowngradeAckRule(cl:client) = {
+    require s.homeCurrentCommand ~= empty1 & s.channel3(cl) = downgradeAck;
+    # cl keeps its copy (now O or S) but loses write permission.
+    s.homeexclusiveGranted := false;
+    s.channel3(cl) := empty3;
+}
+
+# ---------------------------------------------------------------------------
+# Home directory: grants.  Each of these ends the current command.
+# ---------------------------------------------------------------------------
+
+# Read request, other copies exist -> S.
+action grantsharedRule = {
+    require s.homeCurrentCommand = reqshared
+            & ~s.homeexclusiveGranted
+            & (exists I. s.homeSharerList(I))
+            & s.channel2_4(s.homeCurrentclient) = empty2_4;
+    s.homeSharerList(s.homeCurrentclient) := true;
+    s.homeCurrentCommand := empty1;
+    s.channel2_4(s.homeCurrentclient) := grantshared;
+}
+
+# Read request, no other copy at all -> E (the MESI/MOESI "exclusive clean"
+# optimisation: the reader may later upgrade to M with no bus traffic).
+action grantexclusiveRule = {
+    require s.homeCurrentCommand = reqshared
+            & (forall I. ~s.homeSharerList(I))
+            & s.channel2_4(s.homeCurrentclient) = empty2_4;
+    s.homeSharerList(s.homeCurrentclient) := true;
+    s.homeexclusiveGranted := true;
+    s.homeCurrentCommand := empty1;
+    s.channel2_4(s.homeCurrentclient) := grantexclusive;
+    owner := s.homeCurrentclient;
+}
+
+# Write request, every other copy invalidated -> M.
+action grantmodifiedRule = {
+    require s.homeCurrentCommand = reqexclusive
+            & (forall I. ~s.homeSharerList(I))
+            & s.channel2_4(s.homeCurrentclient) = empty2_4;
+    s.homeSharerList(s.homeCurrentclient) := true;
+    s.homeexclusiveGranted := true;
+    s.homeCurrentCommand := empty1;
+    s.channel2_4(s.homeCurrentclient) := grantmodified;
+    owner := s.homeCurrentclient;
+}
+
+# ---------------------------------------------------------------------------
+# Client-side grant reception
+# ---------------------------------------------------------------------------
+
+action receivesharedGrantRule(cl:client) = {
+    require s.channel2_4(cl) = grantshared;
+    s.cache(cl) := shared;
+    s.channel2_4(cl) := empty2_4;
+}
+
+action receiveexclusiveGrantRule(cl:client) = {
+    require s.channel2_4(cl) = grantexclusive;
+    s.cache(cl) := exclusive;
+    s.channel2_4(cl) := empty2_4;
+}
+
+action receivemodifiedGrantRule(cl:client) = {
+    require s.channel2_4(cl) = grantmodified;
+    s.cache(cl) := modified;
+    s.channel2_4(cl) := empty2_4;
+}
+
+export reqsharedRule
+export reqexclusiveRule
+export writeExclusiveRule
+export pickNewRequestRule
+export sendinvalidateRule
+export senddowngradeRule
+export clientinvalidatesRule
+export clientdowngradesRule
+export receiveinvalidateAckRule
+export receivedowngradeAckRule
+export grantsharedRule
+export grantexclusiveRule
+export grantmodifiedRule
+export receivesharedGrantRule
+export receiveexclusiveGrantRule
+export receivemodifiedGrantRule
+
+# ===========================================================================
+# SAFETY: the MOESI state compatibility table
+# ===========================================================================
+
+invariant [moesi_M_is_exclusive]
+    forall C1, C2. C1 ~= C2 & s.cache(C1) = modified -> s.cache(C2) = invalid
+
+invariant [moesi_E_is_exclusive]
+    forall C1, C2. C1 ~= C2 & s.cache(C1) = exclusive -> s.cache(C2) = invalid
+
+invariant [moesi_O_compatible_with_S_only]
+    forall C1, C2. C1 ~= C2 & s.cache(C1) = owned
+        -> s.cache(C2) = shared | s.cache(C2) = invalid
+
+invariant [moesi_O_is_unique]
+    forall C1, C2. s.cache(C1) = owned & s.cache(C2) = owned -> C1 = C2
+
+# ===========================================================================
+# Supporting inductive invariants (directory <-> caches agreement)
+# ===========================================================================
+
+# Write permission, if outstanding, belongs to `owner` alone, and `owner` is
+# then the only cache with a copy.
+invariant [excl_unique]
+    s.homeexclusiveGranted & s.homeSharerList(C) -> C = owner
+
+invariant [excl_owner_is_sharer]
+    s.homeexclusiveGranted -> s.homeSharerList(owner)
+
+# A shared copy (or a shared grant in flight) means no writer -- except in the
+# brief window between a cache's E -> S downgrade and the home processing the
+# resulting ack, where `homeexclusiveGranted` is stale.
+invariant [shared_implies_no_writer]
+    (s.cache(C) = shared | s.channel2_4(C) = grantshared)
+        -> s.homeSharerList(C)
+           & (~s.homeexclusiveGranted | s.channel3(C) = downgradeAck)
+
+# A writable copy (or a writable grant in flight) is the owner's.
+invariant [writable_is_owner]
+    (s.cache(C) = exclusive | s.cache(C) = modified
+     | s.channel2_4(C) = grantexclusive | s.channel2_4(C) = grantmodified)
+        -> s.homeSharerList(C) & s.homeexclusiveGranted & C = owner
+
+# The O state: a dirty copy shared with others.  It belongs to `owner` and the
+# line is no longer writable anywhere -- except in the brief window between the
+# cache's M -> O transition and the home processing the downgrade ack.
+invariant [owned_is_owner]
+    s.cache(C) = owned -> s.homeSharerList(C) & C = owner
+
+invariant [owned_not_writable]
+    s.cache(C) = owned & s.homeexclusiveGranted -> s.channel3(C) = downgradeAck
+
+# Probe bookkeeping.
+invariant [probe_implies_sharer]
+    s.homeprobeList(C) -> s.homeSharerList(C)
+
+invariant [invalidate_in_channel]
+    s.channel2_4(C) = invalidate
+        -> s.homeCurrentCommand = reqexclusive
+           & s.homeSharerList(C) & ~s.homeprobeList(C)
+
+invariant [downgrade_in_channel]
+    s.channel2_4(C) = downgrade
+        -> s.homeCurrentCommand = reqshared & s.homeexclusiveGranted
+           & s.homeSharerList(C) & ~s.homeprobeList(C) & C = owner
+
+invariant [invalidateAck_in_channel]
+    s.channel3(C) = invalidateAck
+        -> s.cache(C) = invalid & s.homeCurrentCommand = reqexclusive
+           & s.homeSharerList(C) & ~s.homeprobeList(C)
+
+invariant [downgradeAck_in_channel]
+    s.channel3(C) = downgradeAck
+        -> s.homeCurrentCommand = reqshared & s.homeexclusiveGranted
+           & s.homeSharerList(C) & ~s.homeprobeList(C) & C = owner
+           & s.cache(C) ~= exclusive & s.cache(C) ~= modified
+
+# Unit-capacity channels do not overlap: a client never has a probe pending
+# and an ack outstanding at the same time.
+invariant [no_overlap]
+    s.channel2_4(C) ~= empty2_4 -> s.channel3(C) = empty3
+
+# A cache with a valid copy is on the sharer list.
+invariant [valid_implies_sharer]
+    s.cache(C) ~= invalid -> s.homeSharerList(C)

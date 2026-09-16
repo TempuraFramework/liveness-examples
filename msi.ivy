@@ -1,0 +1,421 @@
+#lang ivy1.8
+
+# ---------------------------------------------------------------------------
+# The MSI cache coherence protocol, over a split-transaction snooping bus.
+#
+#   https://en.wikipedia.org/wiki/MSI_protocol
+#
+# SAFETY-ONLY BASELINE.  `msi_fifo.ivy` and `msi_lex.ivy` extend this model
+# with fairness instrumentation and prove the liveness property
+#
+#       "every processor request eventually receives a response".
+#
+# ---------------------------------------------------------------------------
+# THE PROTOCOL
+#
+# Every cache holds one line (a single address -- the standard abstraction for
+# a coherence proof) in one of three states:
+#
+#   M  modified   this cache has the only copy, and it is dirty
+#   S  shared     this cache has a clean copy; others may too; memory is current
+#   I  invalid    this cache has no copy
+#
+# The processor side issues PrRd / PrWr.  A hit is handled locally; a miss
+# puts a request on the bus:
+#
+#   I + PrRd  ->  BusRd    -> S
+#   I + PrWr  ->  BusRdX   -> M
+#   S + PrWr  ->  BusUpgr  -> M
+#   S + PrRd, M + PrRd, M + PrWr : hit, no bus transaction
+#
+# Every other cache snoops the transaction:
+#
+#   snoop BusRd    :  M -> S  (Flush: write the dirty line back to memory)
+#                     S -> S,  I -> I
+#   snoop BusRdX   :  M -> I  (Flush),  S -> I,  I -> I
+#   snoop BusUpgr  :  S -> I,  I -> I   (no M can exist: the requester is in S)
+#
+# and a cache may also drop a line on its own:
+#
+#   S -> I  silent eviction
+#   M -> I  writeback eviction (Flush)
+#
+# ---------------------------------------------------------------------------
+# THE MODEL
+#
+# Textbook MSI runs on an *atomic* bus: one transaction occupies the bus for a
+# single indivisible cycle, during which every cache snoops.  That model has
+# nothing to prove about liveness beyond bus arbitration.  Real machines use a
+# *split-transaction* bus, and that is what is modelled here: a transaction is
+# a pipeline of separately scheduled steps, with unit-capacity channels
+# between the bus and each cache.
+#
+#   reqchan(C) : cache -> bus    no_req | busrd | busrdx | busupgr
+#   snpchan(C) : bus  -> cache   no_snoop | snp_inv | snp_dgrade      (snoops)
+#                                | dat_shared | dat_modified          (responses)
+#   rspchan(C) : cache -> bus    no_rsp | snp_ack
+#
+# `snpchan` carries both the snoop sent to a bystander and the data/permission
+# sent back to the requester, because in a real bus both travel on the same
+# wires into the cache.  That sharing is not a modelling convenience: it is
+# what makes an unconsumed response *block* the next transaction's snoop, and
+# that blocking is a genuine stage of the liveness argument.
+#
+# The bus carries one transaction at a time:
+#
+#   bus_cmd          the transaction in progress (no_req = bus idle)
+#   bus_owner        the cache that issued it
+#   pending_snoop(C) C has not yet completed its snoop of this transaction
+#   to_snoop(C)      the snoop to C has not even been sent yet
+#
+# so a transaction is
+#
+#   bus_arbitrate   pick a queued request; every other cache owes a snoop
+#   send_snoop(C)   put the snoop in C's channel               (repeat per C)
+#   snoop_respond(C) C applies the snoop and acks              (repeat per C)
+#   recv_ack(C)     the bus retires C's obligation             (repeat per C)
+#   bus_complete    all snoops retired: send data/permission to the requester
+#   recv_dat_*      the requester installs the line
+#
+# ---------------------------------------------------------------------------
+# THE SAFETY PROPERTIES
+#
+# The two halves of the standard definition of coherence (Sorin, Hill & Wood,
+# *A Primer on Memory Consistency and Cache Coherence*, §2.3):
+#
+#   [swmr]  single-writer/multiple-reader: a modified line is the only valid
+#           copy in the machine.
+#   [dvi]   data-value invariant: every valid copy holds the value of the most
+#           recent write.
+#
+# `last_val` is a ghost variable recording that most recent write; it is
+# written only by `pr_store` and is never read by the protocol.
+# ---------------------------------------------------------------------------
+
+# A fixed but arbitrary number of caches.
+finite type cache
+
+# The value stored in the line.  Uninterpreted: coherence does not care what
+# the values are, only that everyone agrees on them.
+type value
+
+type busreq   = { no_req, busrd, busrdx, busupgr }
+type snoopmsg = { no_snoop, snp_inv, snp_dgrade, dat_shared, dat_modified }
+type rspmsg   = { no_rsp, snp_ack }
+type cstate   = { invalid, shared, modified }
+
+object s = {
+    # ----- channels -----
+    var reqchan(C:cache) : busreq       # cache -> bus
+    var snpchan(C:cache) : snoopmsg     # bus   -> cache
+    var snpval(C:cache)  : value        # data riding along with a dat_* message
+    var rspchan(C:cache) : rspmsg       # cache -> bus
+
+    # ----- cache state -----
+    var st(C:cache)  : cstate
+    var val(C:cache) : value
+
+    # ----- bus state -----
+    var bus_cmd   : busreq
+    var bus_owner : cache
+    var pending_snoop(C:cache) : bool
+    var to_snoop(C:cache) : bool
+
+    # ----- memory -----
+    var mem_val : value
+    var dirty   : bool                  # memory is stale (some cache is in M)
+
+    # ----- ghost -----
+    # waiting(C) is raised when C issues a bus request and lowered exactly when
+    # C installs the line it asked for.  This is the predicate the liveness
+    # property in msi_fifo.ivy / msi_lex.ivy talks about.
+    var waiting(C:cache) : bool
+}
+
+var owner    : cache                    # ghost witness: the cache in state M
+var last_val : value                    # ghost: the most recently written value
+
+after init {
+    s.reqchan(C) := no_req;
+    s.snpchan(C) := no_snoop;
+    s.rspchan(C) := no_rsp;
+    s.st(C) := invalid;
+    s.bus_cmd := no_req;
+    s.pending_snoop(C) := false;
+    s.to_snoop(C) := false;
+    s.waiting(C) := false;
+    s.dirty := false;
+    s.mem_val := last_val;
+    s.val(C) := last_val;
+    s.snpval(C) := last_val;
+}
+
+# ---------------------------------------------------------------------------
+# Processor side.
+#
+# These are environment actions: they are the *demand* on the protocol, and we
+# never want to force them to happen, so they keep `require` guards and get no
+# fairness flag in the liveness files.
+#
+# A cache blocks until its outstanding request has been answered
+# (`require ~s.waiting(cl)`), so at most one transaction per cache is in
+# flight.  This is the standard modelling assumption; without it "the request
+# receives a response" is not a well-posed obligation, because `waiting` would
+# no longer identify a single request.
+# ---------------------------------------------------------------------------
+
+# PrRd miss: I -> (BusRd) -> S
+action pr_read(cl:cache) = {
+    require ~s.waiting(cl);
+    require s.st(cl) = invalid & s.reqchan(cl) = no_req;
+    s.reqchan(cl) := busrd;
+    s.waiting(cl) := true;
+}
+
+# PrWr miss or upgrade:  I -> (BusRdX) -> M,   S -> (BusUpgr) -> M
+action pr_write(cl:cache) = {
+    require ~s.waiting(cl);
+    require s.st(cl) ~= modified & s.reqchan(cl) = no_req;
+    if s.st(cl) = shared {
+        s.reqchan(cl) := busupgr;
+    } else {
+        s.reqchan(cl) := busrdx;
+    };
+    s.waiting(cl) := true;
+}
+
+# PrWr hit in M: purely local.  This is the only writer of `last_val`.
+action pr_store(cl:cache, v:value) = {
+    require s.st(cl) = modified;
+    s.val(cl) := v;
+    last_val := v;
+}
+
+# Silent eviction of a clean line.
+action evict_shared(cl:cache) = {
+    require ~s.waiting(cl) & s.st(cl) = shared;
+    s.st(cl) := invalid;
+}
+
+# Writeback eviction of a dirty line.
+action evict_modified(cl:cache) = {
+    require ~s.waiting(cl) & s.st(cl) = modified;
+    s.mem_val := s.val(cl);
+    s.dirty := false;
+    s.st(cl) := invalid;
+}
+
+# ---------------------------------------------------------------------------
+# Bus side.
+# ---------------------------------------------------------------------------
+
+# Start a transaction.  Every *other* cache now owes this transaction a snoop.
+action bus_arbitrate(cl:cache) = {
+    require s.bus_cmd = no_req & s.reqchan(cl) ~= no_req;
+    s.bus_cmd := s.reqchan(cl);
+    s.reqchan(cl) := no_req;
+    s.bus_owner := cl;
+    s.pending_snoop(C) := C ~= cl;
+    s.to_snoop(C) := C ~= cl;
+}
+
+# Deliver the snoop to one bystander.  BusRd only needs a downgrade; BusRdX
+# and BusUpgr need an invalidation.
+action send_snoop(cl:cache) = {
+    require s.bus_cmd ~= no_req & s.to_snoop(cl) & s.snpchan(cl) = no_snoop;
+    if s.bus_cmd = busrd {
+        s.snpchan(cl) := snp_dgrade;
+    } else {
+        s.snpchan(cl) := snp_inv;
+    };
+    s.to_snoop(cl) := false;
+}
+
+# A bystander applies the snoop and acknowledges it.
+action snoop_respond(cl:cache) = {
+    require (s.snpchan(cl) = snp_inv | s.snpchan(cl) = snp_dgrade)
+            & s.rspchan(cl) = no_rsp;
+    if s.st(cl) = modified {            # Flush: write the dirty line back
+        s.mem_val := s.val(cl);
+        s.dirty := false;
+    };
+    if s.snpchan(cl) = snp_inv {
+        s.st(cl) := invalid;
+        # A queued upgrade whose line has just been taken away must be
+        # re-issued as a read-exclusive: the cache no longer has the data.
+        if s.reqchan(cl) = busupgr {
+            s.reqchan(cl) := busrdx;
+        }
+    } else {
+        if s.st(cl) = modified {
+            s.st(cl) := shared;
+        }
+    };
+    s.snpchan(cl) := no_snoop;
+    s.rspchan(cl) := snp_ack;
+}
+
+# The bus retires one snoop obligation.
+action recv_ack(cl:cache) = {
+    require s.bus_cmd ~= no_req & s.rspchan(cl) = snp_ack;
+    s.pending_snoop(cl) := false;
+    s.rspchan(cl) := no_rsp;
+}
+
+# Every bystander has acked: memory is now current, so answer the requester
+# and release the bus.
+action bus_complete = {
+    require s.bus_cmd ~= no_req
+            & (forall I. ~s.pending_snoop(I))
+            & s.snpchan(s.bus_owner) = no_snoop;
+    s.snpval(s.bus_owner) := s.mem_val;
+    if s.bus_cmd = busrd {
+        s.snpchan(s.bus_owner) := dat_shared;
+    } else {
+        s.snpchan(s.bus_owner) := dat_modified;
+    };
+    s.bus_cmd := no_req;
+}
+
+# The requester installs the line.
+action recv_dat_shared(cl:cache) = {
+    require s.snpchan(cl) = dat_shared;
+    s.st(cl) := shared;
+    s.val(cl) := s.snpval(cl);
+    s.snpchan(cl) := no_snoop;
+    s.waiting(cl) := false;
+}
+
+action recv_dat_modified(cl:cache) = {
+    require s.snpchan(cl) = dat_modified;
+    s.st(cl) := modified;
+    s.val(cl) := s.snpval(cl);
+    s.snpchan(cl) := no_snoop;
+    s.dirty := true;
+    owner := cl;
+    s.waiting(cl) := false;
+}
+
+export pr_read
+export pr_write
+export pr_store
+export evict_shared
+export evict_modified
+export bus_arbitrate
+export send_snoop
+export snoop_respond
+export recv_ack
+export bus_complete
+export recv_dat_shared
+export recv_dat_modified
+
+# ---------------------------------------------------------------------------
+# THE COHERENCE PROPERTIES
+# ---------------------------------------------------------------------------
+
+# Single-writer / multiple-reader.
+invariant [swmr] s.st(C) = modified & C ~= D -> s.st(D) = invalid
+
+# Data-value invariant: every valid copy holds the latest written value.
+invariant [dvi] s.st(C) ~= invalid -> s.val(C) = last_val
+
+# ---------------------------------------------------------------------------
+# Supporting invariants.
+#
+# `owner` / `dirty` are the explicit witness for "some cache is in M", which
+# keeps every invariant below quantifier-alternation-free (an existential in
+# an antecedent would break EPR; see LIVENESS_GUIDE.md §4.5).
+# ---------------------------------------------------------------------------
+
+invariant [mod_dirty]    s.st(C) = modified -> s.dirty & C = owner
+invariant [dirty_owner]  s.dirty -> s.st(owner) = modified
+invariant [shared_clean] s.st(C) = shared -> ~s.dirty
+invariant [mem_clean]    ~s.dirty -> s.mem_val = last_val
+
+# ----- channel discipline -----
+
+invariant [pending_busy]    s.pending_snoop(C) -> s.bus_cmd ~= no_req
+invariant [tosnoop_pending] s.to_snoop(C) -> s.pending_snoop(C)
+invariant [ack_pending]     s.rspchan(C) = snp_ack -> s.pending_snoop(C) & ~s.to_snoop(C)
+invariant [ack_no_snp]      s.rspchan(C) = snp_ack -> s.snpchan(C) = no_snoop
+invariant [snp_pending]     (s.snpchan(C) = snp_inv | s.snpchan(C) = snp_dgrade)
+                            -> s.pending_snoop(C) & ~s.to_snoop(C)
+
+# The snoop type always matches the transaction in progress.
+invariant [snp_is_dgrade]   s.bus_cmd = busrd -> s.snpchan(C) ~= snp_inv
+invariant [snp_is_inv]      (s.bus_cmd = busrdx | s.bus_cmd = busupgr)
+                            -> s.snpchan(C) ~= snp_dgrade
+
+# The requester of the transaction in progress is never snooped, and its
+# channels are free.  (This is what makes `bus_complete` enabled as soon as
+# the last ack arrives.)
+invariant [owner_free]
+    s.bus_cmd ~= no_req -> ~s.pending_snoop(s.bus_owner) & s.snpchan(s.bus_owner) = no_snoop
+                           & s.rspchan(s.bus_owner) = no_rsp
+
+# A response in flight belongs to a cache that still owes the *next*
+# transaction a snoop -- the response is blocking that snoop.  This is the
+# "stale grant" situation, and it is a real stage of the liveness pipeline.
+invariant [grant_pending]
+    s.bus_cmd ~= no_req & (s.snpchan(C) = dat_shared | s.snpchan(C) = dat_modified)
+    -> s.pending_snoop(C) & s.to_snoop(C)
+
+# No bystander is ever stuck outside the pipeline: if it still owes a snoop
+# and the snoop has been sent, then the snoop, or its ack, is in flight.
+invariant [not_stuck]
+    s.pending_snoop(C) & ~s.to_snoop(C)
+    -> s.snpchan(C) = snp_inv | s.snpchan(C) = snp_dgrade | s.rspchan(C) = snp_ack
+
+# ----- responses -----
+
+# At most one response is in flight, it carries the current value, and it is
+# only ever issued to a clean machine.
+invariant [one_grant]
+    (s.snpchan(C) = dat_shared | s.snpchan(C) = dat_modified)
+    & (s.snpchan(D) = dat_shared | s.snpchan(D) = dat_modified) -> C = D
+invariant [grant_val]
+    (s.snpchan(C) = dat_shared | s.snpchan(C) = dat_modified) -> s.snpval(C) = last_val
+invariant [grant_clean]
+    (s.snpchan(C) = dat_shared | s.snpchan(C) = dat_modified) -> ~s.dirty
+# An exclusive response is only issued once every other cache is invalid.
+invariant [grant_mod_excl]
+    s.snpchan(C) = dat_modified & D ~= C -> s.st(D) = invalid
+
+# ----- progress of the invalidation / downgrade sweep -----
+
+# A bystander that has acked an invalidating transaction is invalid, and stays
+# invalid until the transaction ends.
+invariant [inv_progress]
+    (s.bus_cmd = busrdx | s.bus_cmd = busupgr) & C ~= s.bus_owner
+    & (~s.pending_snoop(C) | s.rspchan(C) = snp_ack) -> s.st(C) = invalid
+
+# A modified cache always still owes the transaction in progress a snoop, so
+# the machine is clean by the time `bus_complete` is enabled.
+invariant [mod_snooped]
+    s.bus_cmd ~= no_req & s.st(C) = modified
+    -> C ~= s.bus_owner & s.pending_snoop(C) & s.rspchan(C) ~= snp_ack
+
+# ----- requests -----
+
+invariant [req_not_mod]  s.reqchan(C) ~= no_req -> s.st(C) ~= modified
+invariant [upgr_shared]  s.reqchan(C) = busupgr -> s.st(C) = shared
+invariant [busrd_inv]    s.reqchan(C) = busrd -> s.st(C) = invalid
+invariant [owner_not_mod] s.bus_cmd ~= no_req -> s.st(s.bus_owner) ~= modified
+invariant [upgr_owner]   s.bus_cmd = busupgr -> s.st(s.bus_owner) = shared
+
+# ----- the three stages a waiting cache can be in -----
+#
+#   stage 1   reqchan(C) ~= no_req                    request queued at the bus
+#   stage 2   bus_cmd ~= no_req & bus_owner = C       the bus is serving C
+#   stage 3   snpchan(C) = dat_*                      response in flight to C
+
+invariant [waiting_stages]
+    s.waiting(C) <-> (s.reqchan(C) ~= no_req
+                      | (s.bus_cmd ~= no_req & s.bus_owner = C)
+                      | s.snpchan(C) = dat_shared
+                      | s.snpchan(C) = dat_modified)
+
+invariant [stage1_excl]
+    s.reqchan(C) ~= no_req ->
+        ~(s.bus_cmd ~= no_req & s.bus_owner = C)
+        & s.snpchan(C) ~= dat_shared & s.snpchan(C) ~= dat_modified

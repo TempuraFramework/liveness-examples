@@ -1,0 +1,721 @@
+#lang ivy1.8
+
+# ############################################################################
+#
+#   TOMASULO'S ALGORITHM -- liveness
+#
+#   Companion to `tomasulo_documented.ivy`, which documents the machine and
+#   proves its safety (refinement to an in-order reference CPU).  Read that
+#   file first: everything about Tomasulo's algorithm, the tag/renaming
+#   discipline, the ghost `aux` state and the EPR encoding tricks is explained
+#   there and is not repeated here.
+#
+#   This file proves two LIVENESS properties:
+#
+#     [live_ready]      every instruction whose operands are already available
+#                       eventually retires.  No assumptions beyond weak
+#                       fairness of the three arbiters.
+#
+#     [live_nostarve]   *every* instruction in a reservation station
+#                       eventually retires -- no instruction starves.  Proved
+#                       under one extra, explicitly declared assumption which
+#                       section 5 shows is a genuine expressiveness limit of
+#                       EPR rather than a gap in the argument.
+#
+#   Verified with:
+#
+#       $ ~/workplace/venv_ivy/bin/ivy_check tomasulo_liveness.ivy
+#       ...
+#       OK
+#
+#   The proof technique is McMillan's relational ranking method (CAV 2024) as
+#   realised by Ivy's `ranking` tactic; see LIVENESS_GUIDE.md in this
+#   directory, and `german_3channels_lex.ivy` for the closest worked example.
+#
+# ############################################################################
+#
+#   1.  WHY THE MODEL HAD TO CHANGE
+#   ===============================
+#
+#   `tomasulo_documented.ivy` models one synchronous clock cycle as a single
+#   atomic action `toma.step` whose parameters are the arbitration decisions
+#   (`issue_choice`, `issue_eu`, `complete_eu`, `st_choice`).  Modelling
+#   arbiters as adversarial inputs is exactly right for safety -- it proves
+#   correctness for every arbitration policy -- and exactly wrong for
+#   liveness, because an adversarial arbiter starves everything.  Worse, a
+#   fairness assumption cannot even be *stated* about a monolithic step: one
+#   `step` simultaneously retires, dispatches, issues and executes, so a flag
+#   saying "this step ran" says nothing about which of those actually made
+#   progress, and the dispatch half of the same step can undo the ranking
+#   progress made by the issue half.
+#
+#   So the machine is re-expressed here as a set of guarded rules, one per
+#   architectural event, in the style of the other files in this directory
+#   (`german_3channels_*.ivy`).  The state is identical; the transitions are
+#   the same transitions, decomposed and made asynchronous:
+#
+#       dispatch(t,srca,srcb,dst)   allocate station t, capture operands,
+#                                   rename dst  (environment: not fair)
+#       write_reg(r,d) / read_reg(r)  the machine's I/O   (environment)
+#       issue(t)                    t's operands are latched into its
+#                                   functional unit          [fair: wf_issue]
+#       exec_finish(t)              t's functional unit finishes computing
+#                                                            [fair: wf_exec]
+#       writeback(t)                t wins the common data bus, broadcasts
+#                                   (tag t, value), wakes every waiter, and
+#                                   frees the station        [fair: wf_cdb]
+#
+#   Two further differences from the synchronous model, both forced by
+#   liveness and both noted in section 9 of the safety file:
+#
+#   (a) `eu.ready` was an oracle that is never assigned, i.e. a constant.  A
+#       unit whose `ready` bit happened to be false would never complete, and
+#       nothing would ever retire.  Here `st_ready(t)` is set by the fair rule
+#       `exec_finish(t)`: execution takes an arbitrary but finite time.
+#
+#   (b) The pool of execution units (`eu_t`) is gone; each reservation station
+#       owns its functional unit (`st_issued`, `st_ready`, `st_res`).  This is
+#       a real design point -- a reservation station with its own attached
+#       unit -- and it removes the structural hazard on execution units.  It
+#       is a deliberate simplification: with a shared pool, `issue(t)` also
+#       needs a free unit, its enabling guard is no longer stable (another
+#       station can take the last free unit), and weak fairness of the issue
+#       arbiter is then *not* enough -- exactly the situation of
+#       `german_3channels_original.ivy`, which needs strong fairness
+#       (compassion) for the home's request arbiter.  The single genuinely
+#       shared, arbitrated resource that remains here is the one that matters
+#       for Tomasulo: the COMMON DATA BUS.  `writeback(t)` is the bus grant,
+#       and `globally eventually wf_cdb(T)` is the statement that the bus
+#       arbiter is fair.
+#
+#   Nothing is lost on the safety side: the same refinement invariants are
+#   carried over below and re-proved, including the observable statement
+#   `read_reg` returns the in-order value (the `ensure` in `read_reg`).
+#
+# ############################################################################
+#
+#   2.  THE FAIRNESS INSTRUMENTATION
+#   ================================
+#
+#   Each of the three machine rules gets a boolean flag, parameterised by the
+#   station it concerns, pulsed `:= true; := false;` in one atomic step at the
+#   TOP of the rule, before the guard is tested.  So
+#
+#       forall T. globally eventually wf_issue(T)
+#
+#   says "the issue arbiter offers station T a turn infinitely often", which
+#   is an assumption about the SCHEDULER, not about the protocol: it can
+#   always be satisfied (when the guard is false the turn is a stutter step),
+#   so the assumption is not vacuous.  This is the `wf_*` convention of
+#   `german_3channels_lex.ivy`.  The invariants `~wf_issue(T)` etc. record
+#   that the flags are only momentarily true, which the l2s monitor needs.
+#
+#   `dispatch`, `read_reg` and `write_reg` get NO fairness: we never need
+#   instructions to arrive.  Liveness here is a statement about instructions
+#   that are already in flight.
+#
+# ############################################################################
+#
+#   3.  THE GHOST PROGRAM ORDER
+#   ===========================
+#
+#   Liveness of Tomasulo is fundamentally an argument about the WAKE-UP GRAPH:
+#   a station waits for the tags in its operand slots, those stations wait for
+#   their own tags, and so on.  The argument only works because that graph is
+#   acyclic -- a station only ever waits for a station that was dispatched
+#   EARLIER.  The model therefore carries a ghost timestamp:
+#
+#       clock       a logical clock, ticked once per dispatch
+#       st_ts(T)    the value of the clock when station T was allocated
+#
+#   and the fact that makes everything work is [inv_opra_ts] / [inv_oprb_ts]:
+#
+#       a station waiting on tag P is waiting on a LIVE station that is
+#       STRICTLY OLDER than itself.
+#
+#   The second ghost variable is the witness the ranking needs:
+#
+#       oldest      a tag naming a live station of minimal timestamp
+#
+#   maintained by `update_oldest` after every change to the set of live
+#   stations.  It is computed with Ivy's `if some ... minimizing ...` form:
+#
+#       if some m:tag_t. st_valid(m) minimizing st_ts(m) { oldest := m }
+#
+#   which compiles to "assume m is live and no live station has a smaller
+#   timestamp" in the taken branch and "assume no station is live" in the
+#   else branch.  That is precisely how one gets "a finite non-empty set has a
+#   least element" into a first-order proof -- the fact is not derivable in
+#   EPR, and the construct is the sanctioned way to import it (the same device
+#   is used by `german_3channels_fifo.ivy`, where the home serves the oldest
+#   request).  It buys the invariant [inv_oldest] for free.
+#
+# ############################################################################
+
+include order
+instance ts : unbounded_sequence
+
+# `finite type` is what makes the relational rankings below finite (Rule 5 of
+# the paper): `work_created = true` is a legitimate finite bound because the
+# whole universe of tags is finite.  Physically: a machine has finitely many
+# reservation stations and finitely many architectural registers.
+finite type tag_t
+finite type reg_t
+type word_t
+
+# The ALU, as a relation plus a functionality axiom -- see section 3 of
+# `tomasulo_documented.ivy` for why it must not be a function.
+relation f(X:word_t,Y:word_t,Z:word_t)
+axiom [alu_is_a_function] f(X,Y,Z1) & f(X,Y,Z2) -> Z1 = Z2
+
+# ----------------------------------------------------------------------------
+# Reservation stations (indexed by tag)
+# ----------------------------------------------------------------------------
+relation st_valid(T:tag_t)          # holds an instruction that has not retired
+relation st_issued(T:tag_t)         # operands latched, functional unit started
+relation st_ready(T:tag_t)          # the functional unit has finished
+var      st_res(T:tag_t) : word_t   # the computed result, waiting for the bus
+
+relation opra_valid(T:tag_t)        # operand A is a value, not a promise
+relation opra_tag(T:tag_t,P:tag_t)  # ... otherwise, whose result it waits for
+var      opra_val(T:tag_t) : word_t
+relation oprb_valid(T:tag_t)
+relation oprb_tag(T:tag_t,P:tag_t)
+var      oprb_val(T:tag_t) : word_t
+
+# ----------------------------------------------------------------------------
+# Architectural register file, with renaming information
+# ----------------------------------------------------------------------------
+relation ir_resvd(R:reg_t)
+relation ir_tag(R:reg_t,T:tag_t)
+var      ir_val(R:reg_t) : word_t
+
+# ----------------------------------------------------------------------------
+# Ghost state
+# ----------------------------------------------------------------------------
+var ref_r(R:reg_t) : word_t         # the in-order reference register file
+var aux_opra(T:tag_t) : word_t      # what the in-order machine read ...
+var aux_oprb(T:tag_t) : word_t
+var aux_res(T:tag_t) : word_t       # ... and computed, for this station
+var st_ts(T:tag_t) : ts             # program-order timestamp (section 3)
+var clock : ts
+var oldest : tag_t                  # a live station of least timestamp
+
+# ----------------------------------------------------------------------------
+# Fairness flags (section 2)
+# ----------------------------------------------------------------------------
+var wf_issue(T:tag_t) : bool
+var wf_exec(T:tag_t) : bool
+var wf_cdb(T:tag_t) : bool
+
+after init {
+    st_valid(T) := false;
+    st_issued(T) := false;
+    ir_resvd(R) := false;
+    # As in the safety file: start the tag relations full rather than
+    # unconstrained, so that no initial oracle value can silently block a
+    # rule.  No invariant mentions them while nothing is reserved.
+    ir_tag(R,T) := true;
+    opra_tag(T,P) := true;
+    oprb_tag(T,P) := true;
+    ref_r(R) := ir_val(R);          # the two machines start in agreement
+    wf_issue(T) := false;
+    wf_exec(T) := false;
+    wf_cdb(T) := false;
+    clock := 0;
+    clock := clock.next;            # timestamp 0 is never handed out, so
+    st_ts(T) := 0;                  # st_ts(T) < clock holds from the start
+}
+
+# Recompute the `oldest` witness.  Called after every change to `st_valid`.
+action update_oldest = {
+    if some m:tag_t. st_valid(m) minimizing st_ts(m) {
+        oldest := m
+    }
+}
+
+# ############################################################################
+#  4.  THE MACHINE
+# ############################################################################
+
+# ----------------------------------------------------------------------------
+# Dispatch an ALU instruction into station t.
+#
+# `require ~st_valid(t)` is the structural hazard: in the synchronous model
+# this was `stallout`; here a stalled dispatch is simply a rule that does not
+# fire.  Operands are read from the register file: a value if the source is
+# not renamed, otherwise the source's tag (a promise).  Then dst is renamed to
+# t.  Note the reads happen before the writes, so `dispatch(t,r,r,r)` behaves
+# like the hardware.
+#
+# The ghost half runs the in-order reference machine for this instruction and
+# records what it read and computed in `aux`.
+# ----------------------------------------------------------------------------
+action dispatch(t:tag_t, srca:reg_t, srcb:reg_t, dst:reg_t) = {
+    require ~st_valid(t);
+    var ra : word_t;
+    var rb : word_t;
+    var rs : word_t;
+    ra := ref_r(srca);
+    rb := ref_r(srcb);
+    rs := *;
+    assume f(ra,rb,rs);
+    aux_opra(t) := ra;
+    aux_oprb(t) := rb;
+    aux_res(t)  := rs;
+
+    opra_valid(t) := ~ir_resvd(srca);
+    opra_tag(t,X) := ir_tag(srca,X);
+    opra_val(t)   := ir_val(srca);
+    oprb_valid(t) := ~ir_resvd(srcb);
+    oprb_tag(t,X) := ir_tag(srcb,X);
+    oprb_val(t)   := ir_val(srcb);
+
+    st_valid(t)  := true;
+    st_issued(t) := false;
+    st_ready(t)  := false;
+
+    ir_resvd(dst) := true;
+    ir_tag(dst,X) := X = t;
+    ref_r(dst) := rs;
+
+    st_ts(t) := clock;              # ghost: program order
+    clock := clock.next;
+    update_oldest;
+}
+
+# Write an immediate into a register.  Cancels any outstanding renaming of
+# that register -- legal, because from the in-order machine's point of view
+# this is the newest writer.
+action write_reg(r:reg_t, d:word_t) = {
+    ir_val(r)   := d;
+    ir_resvd(r) := false;
+    ref_r(r)    := d;
+}
+
+# The machine's observable output.  A read of a renamed register stalls
+# (`require ~ir_resvd(r)`); a read that is answered returns the in-order
+# value.  That `ensure` is the refinement theorem, discharged by [inv_reg_ready].
+action read_reg(r:reg_t) returns (v:word_t) = {
+    require ~ir_resvd(r);
+    v := ir_val(r);
+    ensure v = ref_r(r)
+}
+
+# Issue: both operands are values, so latch them and start the unit.
+action issue(t:tag_t) = {
+    wf_issue(t) := true;
+    wf_issue(t) := false;
+    if st_valid(t) & opra_valid(t) & oprb_valid(t) & ~st_issued(t) {
+        var v : word_t;
+        v := *;
+        assume f(opra_val(t),oprb_val(t),v);
+        st_res(t)    := v;
+        st_issued(t) := true;
+        st_ready(t)  := false;
+    }
+}
+
+# Execution completes, after an arbitrary but finite time.
+action exec_finish(t:tag_t) = {
+    wf_exec(t) := true;
+    wf_exec(t) := false;
+    if st_valid(t) & st_issued(t) & ~st_ready(t) {
+        st_ready(t) := true;
+    }
+}
+
+# ----------------------------------------------------------------------------
+# The common data bus is granted to station t.
+#
+# If t has a result, it is broadcast: every register and every operand slot
+# waiting for tag t latches the value in this one atomic step (the snooping
+# comparator arrays of the RTL, one line of Ivy each), and t is freed.  This
+# is the only rule that makes a waiting operand valid, and the only rule that
+# frees a station -- which is why it is the top of the ranking hierarchy.
+# ----------------------------------------------------------------------------
+action writeback(t:tag_t) = {
+    wf_cdb(t) := true;
+    wf_cdb(t) := false;
+    if st_valid(t) & st_issued(t) & st_ready(t) {
+        ir_val(R)   := st_res(t) if ir_resvd(R) & ir_tag(R,t) else ir_val(R);
+        ir_resvd(R) := ~ir_tag(R,t) & ir_resvd(R);
+        opra_val(K)   := st_res(t) if ~opra_valid(K) & opra_tag(K,t) else opra_val(K);
+        opra_valid(K) := opra_tag(K,t) | opra_valid(K);
+        oprb_val(K)   := st_res(t) if ~oprb_valid(K) & oprb_tag(K,t) else oprb_val(K);
+        oprb_valid(K) := oprb_tag(K,t) | oprb_valid(K);
+        st_valid(t) := false;
+        update_oldest;
+    }
+}
+
+export dispatch
+export write_reg
+export read_reg
+export issue
+export exec_finish
+export writeback
+
+# ############################################################################
+#  5.  INVARIANTS
+# ############################################################################
+
+# --- the fairness flags are only momentarily true ---------------------------
+invariant ~wf_issue(T)
+invariant ~wf_exec(T)
+invariant ~wf_cdb(T)
+
+# --- the refinement invariants, carried over from tomasulo_documented.ivy ---
+# (their meaning is explained in section 7 of that file)
+invariant [inv_opra_val]     st_valid(K) & opra_valid(K) -> opra_val(K) = aux_opra(K)
+invariant [inv_oprb_val]     st_valid(K) & oprb_valid(K) -> oprb_val(K) = aux_oprb(K)
+invariant [inv_reg_ready]    ~ir_resvd(R) -> ir_val(R) = ref_r(R)
+invariant [inv_reg_reserved] ir_resvd(R) & ir_tag(R,K) -> st_valid(K) & aux_res(K) = ref_r(R)
+invariant [inv_opra_dep]     st_valid(K) & ~opra_valid(K) & opra_tag(K,T)
+                                 -> st_valid(T) & aux_res(T) = aux_opra(K)
+invariant [inv_oprb_dep]     st_valid(K) & ~oprb_valid(K) & oprb_tag(K,T)
+                                 -> st_valid(T) & aux_res(T) = aux_oprb(K)
+invariant [inv_aux_alu]      st_valid(T) -> f(aux_opra(T),aux_oprb(T),aux_res(T))
+# the value sitting in a started functional unit is the in-order result
+invariant [inv_res]          st_valid(T) & st_issued(T) -> st_res(T) = aux_res(T)
+
+# --- the program-order invariants, new here ---------------------------------
+invariant [inv_ts_clock]  st_valid(T) -> st_ts(T) < clock
+invariant [inv_reg_ts]    ir_resvd(R) & ir_tag(R,K) -> st_ts(K) < clock
+
+# THE WAKE-UP GRAPH IS ACYCLIC.  A station only ever waits for a strictly
+# older station.  Inductive because at dispatch the new station gets the
+# largest timestamp, and the tags it captures come from the register file,
+# where [inv_reg_ts] says every renaming is older than the clock.
+invariant [inv_opra_ts]   st_valid(K) & ~opra_valid(K) & opra_tag(K,T) -> st_ts(T) < st_ts(K)
+invariant [inv_oprb_ts]   st_valid(K) & ~oprb_valid(K) & oprb_tag(K,T) -> st_ts(T) < st_ts(K)
+
+# `oldest` really is a live station of least timestamp.  Free, from the
+# `minimizing` form in `update_oldest` (section 3).
+invariant [inv_oldest]    st_valid(M) -> st_valid(oldest) & st_ts(oldest) <= st_ts(M)
+
+# ############################################################################
+#  6.  FAIRNESS ASSUMPTIONS
+# ############################################################################
+#
+# One per arbiter, all weak (justice).  No compassion anywhere -- see
+# section 1 (b) for the design choice that makes weak fairness sufficient.
+
+explicit temporal axiom [wfa_issue] forall T. globally eventually wf_issue(T)
+explicit temporal axiom [wfa_exec]  forall T. globally eventually wf_exec(T)
+explicit temporal axiom [wfa_cdb]   forall T. globally eventually wf_cdb(T)
+
+# ############################################################################
+#  7.  FIRST PROPERTY: an instruction with its operands retires
+# ############################################################################
+#
+#       forall T. globally ( st_valid(T) & opra_valid(T) & oprb_valid(T)
+#                            -> eventually ~st_valid(T) )
+#
+# "Once an instruction's operands are available, it retires."  This is the
+# statement that the back end -- issue, execute, writeback -- never deadlocks
+# and never starves anybody, and it needs no assumption beyond the three weak
+# fairness conditions.  It is proved BEFORE the extra assumption of section 8
+# is declared, so it does not depend on it.
+#
+# THE RANKING.  Station _T walks a three-stage pipeline
+#
+#       ~issued   --issue(_T)-->   issued & ~ready
+#                 --exec_finish(_T)-->   issued & ready
+#                 --writeback(_T)-->   retired
+#
+# so this is the textbook Rule-8/Rule-10 pipeline of LIVENESS_GUIDE section 8,
+# with one component per stage.  Following the recipe there, each lower-order
+# component ranks on the UNION of the stages still to come, so that the action
+# advancing _T one stage conserves it:
+#
+#   [00]  {_T}                      reduced by writeback  (highest order)
+#   [01]  {_T} while not (issued and ready)   reduced by exec_finish
+#   [02]  {_T} while not issued              reduced by issue
+#
+# `issue(_T)` sets `st_issued` and clears `st_ready`, so _T stays inside [01];
+# it only leaves [01] when `exec_finish` fires.  Each scheduler is literally
+# the enabling guard of its rule, which is what `l2s_progress` needs: unlike
+# conservation and stability, progress is not discounted by preemption, so a
+# component must reduce its own ranking whenever its scheduler is on.
+#
+# `l2s_sched_exists` (premise S4) is the case split "_T is not issued, or is
+# issued and not ready, or is issued and ready" -- exhaustive, so something is
+# always scheduled.  That is the whole content of the proof.
+
+explicit temporal property [live_ready]
+  forall T. globally ((st_valid(T) & opra_valid(T) & oprb_valid(T))
+                      -> eventually ~st_valid(T))
+proof {
+  tactic skolemizenp;
+  instantiate wfa_issue;
+  instantiate wfa_exec;
+  instantiate wfa_cdb;
+  tactic ranking with {
+    # [00] the bus grant retires _T.
+    definition work_created[00](M:tag_t) = true
+    definition work_needed[00](M:tag_t)  = M = _T & st_valid(_T)
+    definition work_invar[00]            = st_valid(_T) & opra_valid(_T) & oprb_valid(_T)
+    definition work_progress[00](N:tag_t)= wf_cdb(N)
+    definition work_helpful[00](N:tag_t,M:tag_t) = N = _T & M = _T
+                                           & st_valid(_T) & st_issued(_T) & st_ready(_T)
+
+    # [01] execution completes.  The ranking is the union of the two stages
+    # still to come, so `issue` conserves it.
+    definition work_created[01](M:tag_t) = true
+    definition work_needed[01](M:tag_t)  = M = _T & st_valid(_T)
+                                           & ~(st_issued(_T) & st_ready(_T))
+    definition work_invar[01]            = st_valid(_T) & opra_valid(_T) & oprb_valid(_T)
+    definition work_progress[01](N:tag_t)= wf_exec(N)
+    definition work_helpful[01](N:tag_t,M:tag_t) = N = _T & M = _T
+                                           & st_valid(_T) & st_issued(_T) & ~st_ready(_T)
+
+    # [02] the instruction is issued into its functional unit.
+    definition work_created[02](M:tag_t) = true
+    definition work_needed[02](M:tag_t)  = M = _T & st_valid(_T) & ~st_issued(_T)
+    definition work_invar[02]            = st_valid(_T) & opra_valid(_T) & oprb_valid(_T)
+    definition work_progress[02](N:tag_t)= wf_issue(N)
+    definition work_helpful[02](N:tag_t,M:tag_t) = N = _T & M = _T
+                                           & st_valid(_T) & ~st_issued(_T)
+  }
+}
+
+# ############################################################################
+#  8.  THE ONE EXTRA ASSUMPTION
+# ############################################################################
+#
+#   "A station that is waiting for an operand is waiting for SOMETHING."
+#
+#   This is the only thing below that is assumed rather than proved, and it is
+#   worth being precise about what it is and why it is here, because it is a
+#   textbook instance of the stratification pitfall of LIVENESS_GUIDE section
+#   4.5 / paper section 4.2.
+#
+#   WHAT THE PROOF NEEDS.  Premise S4 of Rule 10 (`l2s_sched_exists`) says
+#   that while the liveness invariant holds, some component is scheduled.  For
+#   [live_nostarve] the liveness invariant is "_T is still in its station",
+#   and the state that would falsify S4 is "every live station at least as old
+#   as _T is blocked waiting for an operand" -- a deadlocked wake-up graph.
+#   The machine cannot reach such a state, and the argument is one line:
+#
+#       `oldest` is a live station of least timestamp ([inv_oldest]); if it
+#       were waiting for a tag P then P would be live and strictly older
+#       ([inv_opra_dep], [inv_opra_ts]), contradicting minimality.
+#
+#   Notice this needs NO induction over the chain and NO pigeonhole argument:
+#   one step from the minimum suffices.  That is exactly what the `minimizing`
+#   witness in `update_oldest` was introduced for.
+#
+#   WHAT EPR CANNOT SAY.  The argument silently uses "if `oldest` is waiting
+#   then there IS some tag P it waits for", i.e.
+#
+#       forall K. st_valid(K) & ~opra_valid(K) -> exists P. opra_tag(K,P)
+#
+#   a universally quantified tag in the scope of an existentially quantified
+#   tag.  That is a self-loop in the quantifier-alternation graph, and
+#   `ivy_check` rejects it outright:
+#
+#       error: The verification condition is not in the fragment FAU.
+#       The following terms may generate an infinite sequence of instantiations:
+#         otag(K,T_a)   (position 1 is a function from tag_t to tag_t)
+#         skolem function defined by: exists T_a. otag(K,T_a)
+#
+#   Every repair one would try fails the same way, because they are all the
+#   same formula: storing the producer as a scalar `opra_tagv(K) : tag_t`
+#   makes the invariant `opra_tag(K,opra_tagv(K))`, rejected with the same
+#   message; recording the producer's timestamp `opra_pts(K) : ts` moves the
+#   existential to "some live station has timestamp W", which needs an arc
+#   ts -> tag_t and closes a cycle with `st_ts : tag_t -> ts`.  The fact is
+#   simply "this relation is non-empty", and non-emptiness of a relation is
+#   not expressible in EPR at all.
+#
+#   CONTRAST WITH THE TICKET PROTOCOL.  `ticket_ranking.ivy` in this directory
+#   gets away with the structurally identical invariant
+#
+#       forall K:ticket. next_ticket > K & service <= K
+#                        -> exists T:thread. m(T,K) & ~pc1(T)
+#
+#   precisely because the quantifiers are over DIFFERENT sorts and the map
+#   thread -> ticket is kept as a relation `m(T,K)` -- the file's own comment
+#   says "use relation and not a function to be in EPR".  The arc
+#   ticket -> thread is then acyclic.  Tomasulo has no such luck: a station
+#   waits for a station, so the arc is tag_t -> tag_t whatever one does.
+#
+#   THE ASSUMPTION.  We therefore assume the statement only at the ground term
+#   `oldest`, where the existential Skolemises to a CONSTANT and no cycle
+#   arises.  It is declared as a non-explicit `temporal axiom` of the form
+#   `globally P`, which Ivy adds to the model as an assumed invariant.  It is
+#   the weakest form of the missing fact: it says nothing about who the
+#   producer is, only that a waiting slot is waiting for somebody, and
+#   everything else -- that the producer is live, that it is older, that this
+#   contradicts minimality -- is proved from [inv_opra_dep], [inv_opra_ts] and
+#   [inv_oldest].  Section 10 shows that removing it fails exactly one check,
+#   `l2s_sched_exists`, and nothing else.
+#
+#   That the assumption is TRUE of the machine is immediate by inspection of
+#   the code: `opra_tag(t,X) := ir_tag(srca,X)` is the only assignment to an
+#   operand tag relation, `ir_tag(dst,X) := X = t` and the full initialisation
+#   `ir_tag(R,T) := true` are the only assignments to a register tag relation,
+#   and none of the three can produce the empty relation.
+
+temporal axiom [oldest_waits_for_someone]
+  globally ((st_valid(oldest) & ~opra_valid(oldest) -> exists P. opra_tag(oldest,P))
+          & (st_valid(oldest) & ~oprb_valid(oldest) -> exists P. oprb_tag(oldest,P)))
+
+# ############################################################################
+#  9.  SECOND PROPERTY: no instruction starves
+# ############################################################################
+#
+#       forall T. globally ( st_valid(T) -> eventually ~st_valid(T) )
+#
+# Every instruction that enters a reservation station eventually leaves it.
+# Since a station is freed only by the broadcast of its own result, this says
+# that every dispatched instruction is eventually executed and written back:
+# out-of-order execution does not starve anybody, no matter how the
+# dependences are tangled and no matter how many later instructions overtake.
+#
+# THE RANKING.  Write
+#
+#       A  =  { M : st_valid(M) & st_ts(M) <= st_ts(_T) }
+#
+# for the live stations that are at least as old as _T.  A contains _T, and A
+# is the top-order ranking:
+#
+#   [00]  A                                      reduced by writeback
+#   [01]  A minus the (issued and ready) stations reduced by exec_finish
+#   [02]  A minus the issued stations             reduced by issue
+#
+# WHY A IS A LEGAL RANKING -- this is the crux, and it is where the ghost
+# timestamps earn their keep.  A must never grow:
+#
+#   * `dispatch(t)` gives t the timestamp `clock`, and [inv_ts_clock] with
+#     `st_valid(_T)` (the liveness invariant) gives st_ts(_T) < clock.  So a
+#     freshly dispatched station is strictly YOUNGER than _T and lands outside
+#     A.  This is the formal content of "later instructions cannot delay an
+#     earlier one indefinitely": the machine may keep dispatching forever, and
+#     the ranking does not notice.
+#   * `writeback` removes a station from A and adds none.
+#   * `issue` and `exec_finish` do not touch `st_valid` or `st_ts` at all.
+#
+# and A is finite because `tag_t` is a finite type, so `work_created = true`
+# is a legitimate finite bound (Rule 5).
+#
+# [01] and [02] are again unions of the remaining stages, for the same reason
+# as in section 7, so that `issue` conserves [01] and nothing conserves less
+# than it must.
+#
+# WHY SOMETHING IS ALWAYS SCHEDULED (premise S4).  `oldest` is in A: it is
+# live and of minimal timestamp, so certainly no younger than _T.  By the
+# argument of section 8 it is not waiting for an operand.  So it is either not
+# issued (scheduler [02] fires, and `issue(oldest)`'s guard is exactly
+# "live, operands valid, not issued"), or issued and not ready ([01]), or
+# issued and ready ([00]).  Exhaustive.
+#
+# WHY THE ORDER IS LEXICOGRAPHIC RATHER THAN A FLAT RULE-8 PROOF.  [00] must
+# preempt [01] and [02]: when a station M other than _T is written back, M
+# leaves A, which SHRINKS [01] and [02] as well -- that is fine -- but M's
+# broadcast also makes operands valid all over the machine and can move
+# stations between the stages that [01] and [02] measure.  Keeping [00]
+# highest means the two lower components carry no conservation obligation in
+# exactly the states where the bus is active.  In practice the components here
+# are conserved anyway; the lexicographic reading is the one that explains why
+# the proof is structured this way, and `ranking` is in any case the more
+# robust tactic on this build (LIVENESS_GUIDE section 4.4).
+
+explicit temporal property [live_nostarve]
+  forall T. globally (st_valid(T) -> eventually ~st_valid(T))
+proof {
+  tactic skolemizenp;
+  instantiate wfa_issue;
+  instantiate wfa_exec;
+  instantiate wfa_cdb;
+  tactic ranking with {
+    # [00] the bus retires one of the stations at least as old as _T.
+    definition work_created[00](M:tag_t) = true
+    definition work_needed[00](M:tag_t)  = st_valid(M) & st_ts(M) <= st_ts(_T)
+    definition work_invar[00]            = st_valid(_T)
+    definition work_progress[00](N:tag_t)= wf_cdb(N)
+    definition work_helpful[00](N:tag_t,M:tag_t) = N = M & st_valid(M) & st_ts(M) <= st_ts(_T)
+                                                   & st_issued(M) & st_ready(M)
+
+    # [01] one of them finishes executing.
+    definition work_created[01](M:tag_t) = true
+    definition work_needed[01](M:tag_t)  = st_valid(M) & st_ts(M) <= st_ts(_T)
+                                           & ~(st_issued(M) & st_ready(M))
+    definition work_invar[01]            = st_valid(_T)
+    definition work_progress[01](N:tag_t)= wf_exec(N)
+    definition work_helpful[01](N:tag_t,M:tag_t) = N = M & st_valid(M) & st_ts(M) <= st_ts(_T)
+                                                   & st_issued(M) & ~st_ready(M)
+
+    # [02] one of them is issued.  The scheduler carries the operand-readiness
+    # conjuncts because they are part of `issue`'s guard: without them
+    # `l2s_progress[02]` fails (section 10, ablation C).
+    definition work_created[02](M:tag_t) = true
+    definition work_needed[02](M:tag_t)  = st_valid(M) & st_ts(M) <= st_ts(_T)
+                                           & ~st_issued(M)
+    definition work_invar[02]            = st_valid(_T)
+    definition work_progress[02](N:tag_t)= wf_issue(N)
+    definition work_helpful[02](N:tag_t,M:tag_t) = N = M & st_valid(M) & st_ts(M) <= st_ts(_T)
+                                                   & ~st_issued(M)
+                                                   & opra_valid(M) & oprb_valid(M)
+  }
+}
+
+# ############################################################################
+#
+#  10.  NON-VACUITY / LOAD-BEARING CHECKS  (all actually run)
+#  =========================================================
+#
+#  On [live_nostarve]:
+#
+#    A. delete `temporal axiom [oldest_waits_for_someone]`
+#         -> 7 failures, all of them the SAME check `l2s_sched_exists` (it is
+#            re-checked once per exported action) and nothing else.  The
+#            assumption is used for exactly one premise, S4, which is what
+#            section 8 claims.
+#    B. `work_progress[00] := false`
+#         -> `l2s_progress[00]`, `l2s_progress_eventually[00]`,
+#            `l2s_sched_stable[00] ... FAIL`.  The bus fairness is what
+#            reduces the top ranking.
+#    C. drop `opra_valid(M) & oprb_valid(M)` from `work_helpful[02]`
+#         -> `l2s_progress[02] ... FAIL`.  The scheduler must be the enabling
+#            guard of `issue`: scheduling a blocked station does not make
+#            progress.  (This is the check that shows the stable scheduler is
+#            doing real work and not decoration.)
+#    D. delete component [00] entirely
+#         -> `l2s_sched_exists ... FAIL` again (and only that).  Two
+#            components cannot cover the "issued and ready" state.
+#    E. do not `instantiate wfa_cdb`
+#         -> `l2s_progress[00]`, `l2s_progress_eventually[00] ... FAIL`.
+#
+#  On the model itself, in the same spirit as section 8 of the safety file:
+#  adding `invariant ~(st_valid(T) & st_issued(T))` makes `ivy_check` report
+#  exactly one failure, in `issue`, so instructions really are dispatched and
+#  issued and the rules are not all vacuously blocked by their `assume`s.
+#
+#  11.  WHAT IS STILL OPEN
+#  =======================
+#
+#  * The shared execution-unit pool of `tomasulo_documented.ivy` (section
+#    1 (b)).  With a pool, `issue`'s guard "some unit is free" is not stable,
+#    so weak fairness of the issue arbiter is not enough; the honest statement
+#    would add a compassion assumption
+#
+#      forall T. (globally eventually (T is issuable & some unit is free))
+#                -> (globally eventually T is issued)
+#
+#    and discharge its antecedent from "every busy unit is eventually freed",
+#    in the three-way tableau case split of `german_3channels_original.ivy` /
+#    `strongfair.ivy`.  That is the natural next file.
+#
+#  * Removing the assumption of section 8.  It is not a matter of finding a
+#    better ranking: the missing fact is the non-emptiness of a tag-to-tag
+#    relation, which EPR cannot state.  Two escapes are conceivable, neither
+#    of them free: pay for liveness in the model instead of in the assumption,
+#    as `german_3channels_fifo.ivy` does (e.g. dispatch in a fixed circular
+#    order so that the oldest live station is a maintained pointer rather than
+#    a minimum -- but the circular successor is again a tag_t -> tag_t
+#    function); or step outside the decidable fragment for that one
+#    obligation and discharge it with an interactive proof.
+#
+# ############################################################################

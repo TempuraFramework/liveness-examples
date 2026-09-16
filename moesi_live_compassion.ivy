@@ -1,0 +1,777 @@
+#lang ivy1.8
+
+# ===========================================================================
+# MOESI cache coherence protocol -- LIVENESS (arbitrary arbiter)
+#
+#   "every memory access issued by a cache is eventually served"
+#
+#       forall C. globally ( waiting(C) -> eventually ~waiting(C) )
+#
+# under weak fairness (justice) for every rule of the protocol, PLUS
+# compassion (strong fairness) for the home's request arbiter.
+#
+# The model is `moesi.ivy` (read that file first for the protocol itself),
+# plus four additions:
+#
+#   1. `finite type client`  -- a fixed but arbitrary number of caches.  This
+#      is what makes `work_created = true` a legitimate finite bound R
+#      (Rule 5 of McMillan, CAV'24).
+#   2. a ghost bit `waiting(C)`, raised when C issues a request and lowered
+#      when C consumes the corresponding grant.  `~waiting(C)` is exactly
+#      "the access completed".  Clients block while waiting, so at most one
+#      request per cache is in flight and the obligation is well posed.
+#   3. weak-fairness instrumentation: every rule gets a flag pulsed
+#      *before* its guard is tested, and the rule becomes a guarded command.
+#      `globally eventually wf_x` then says "the scheduler offers rule x a
+#      turn infinitely often", which is a statement about the scheduler and
+#      not about the protocol -- see LIVENESS_CASE_STUDY_GERMAN.md section 3.
+#   4. a compassion (strong fairness) assumption for the request arbiter.
+#
+# ---------------------------------------------------------------------------
+# WHY COMPASSION
+#
+# `pickNewRequestRule(cl)` picks an *arbitrary* client with a pending request.
+# Under weak fairness the scheduler must offer client _C's pick a turn
+# infinitely often, but it may offer every one of those turns while the home
+# is busy serving somebody else: other caches cycle request -> service ->
+# request forever, the home is idle only in the instants between a grant and
+# the next pick, and the adversary simply never schedules _C's turn in one of
+# those instants.  The property is *false* under weak fairness alone.  This is
+# not an artefact of the encoding; it is a property of an arbiter that does
+# not remember who is waiting.  So we assume compassion, and only for the
+# arbiter -- every other rule has a guard that is stable once enabled.
+#
+# `moesi_live.ivy` proves the *incomparable* theorem for a MOESI home with a
+# FIFO arbiter, where weak fairness alone suffices.  Neither result implies
+# the other.
+#
+# ---------------------------------------------------------------------------
+# THE THREE STAGES
+#
+# A waiting client is in exactly one of
+#
+#   stage 1   channel1(C) ~= empty1                       request queued
+#   stage 2   homeCurrentCommand ~= empty1 & hcc = C      the home is serving C
+#   stage 3   channel2_4(C) = grant{shared,exclusive,modified}   grant in flight
+#
+# (invariant [waiting_stages]; [stage1_excl] / [stage2_excl] make them
+# disjoint).  This is what discharges the "something is always scheduled"
+# premise S4 of the ranking rule.
+#
+# ---------------------------------------------------------------------------
+# THE LEXICOGRAPHIC RANKING  (Rule 10 / 11; tactic `ranking`)
+#
+#   [00][01]     stage 1: the two tableau cases of the compassion antecedent
+#                                                               (highest)
+#   [02][03][04] stage 3: _C consumes its grant (one per grant kind)
+#   [05][06][07] stage 2: the invalidation pipeline  (write requests)
+#   [08][09][10] stage 2: the downgrade pipeline     (read requests, M/E hit)
+#   [11][12][13] stage 2: draining a stale grant that blocks a probe
+#   [14][15][16] stage 2: the home issues the grant, ending the command
+#                                                               (lowest)
+#
+# Why it has to be lexicographic and not Rule 8 (`l2s_auto5`): while _C sits
+# in stage 1 or stage 3, the home runs *whole commands for other clients*,
+# and those grow every pipeline ranking ([05] grows when a grant adds a
+# sharer, [14] grows when a pick makes the home busy).  Rule 8 requires every
+# ranking to be conserved by every action, so it would need the pipeline to
+# be lifted into a separate lemma.  Rule 10 lets a *preempted* component --
+# one for which a higher-order scheduler is on -- grow.  The load-bearing
+# fact is
+#
+#     ~pre([05]..[16])  /\  waiting(_C)
+#       ==>  stage 2,  or  ( stage 1  and  ~(eventually E) )
+#
+# and both of those imply homeCurrentCommand ~= empty1: if no stage-1 or
+# stage-3 scheduler is on and _C is waiting, then either the home is serving
+# _C, or _C's request is queued while ~(eventually E) says the home is never
+# idle again.  A busy home cannot pick, so nothing grows the pipeline in the
+# non-preempted region.  That is why every pipeline ranking carries a "the
+# home is busy" conjunct.
+#
+# Two `ranking`-tactic facts worth knowing (see LIVENESS_CASE_STUDY_GERMAN.md
+# section 6): only `l2s_needed_preserved` and `l2s_sched_stable` get the
+# preemption discount -- `l2s_progress` does not, so every scheduler below is
+# literally the enabling guard of its rule.  And component suffixes are
+# sorted as *strings*, hence two digits.
+# ===========================================================================
+
+# A fixed, but arbitrary, number of caches.  Finiteness is what makes the
+# relational rankings below finite (Rule 5).
+finite type client
+
+type message1    = { empty1 , reqshared , reqexclusive }
+type message2_4  = { empty2_4 , invalidate , downgrade ,
+                     grantshared , grantexclusive , grantmodified }
+type message3    = { empty3 , invalidateAck , downgradeAck }
+type cachestate  = { invalid , shared , owned , exclusive , modified }
+
+object s = {
+    var channel1(C:client)   : message1
+    var channel2_4(C:client) : message2_4
+    var channel3(C:client)   : message3
+    var cache(C:client)      : cachestate
+
+    var homeSharerList(C:client)  : bool
+    var homeprobeList(C:client)   : bool
+    var homeexclusiveGranted      : bool
+    var homeCurrentCommand        : message1
+    var homeCurrentclient         : client
+
+    # Ghost: "C has an outstanding access".  Raised at the request, lowered
+    # when the grant is consumed.  The liveness property is about this bit.
+    var waiting(C:client) : bool
+}
+
+var owner : client       # the cache holding the line writable, or owning it
+
+# ---------------------------------------------------------------------------
+# Weak-fairness (justice) flags: one per rule, pulsed unconditionally before
+# the guard, so the rule is always callable and a turn on a disabled rule is
+# a stutter step.
+# ---------------------------------------------------------------------------
+
+var wf_pick(C:client)        : bool      # pickNewRequestRule: turn offered
+var f_pick(C:client)         : bool      # pickNewRequestRule: actually fired
+var wf_sendinv(C:client)     : bool      # sendinvalidateRule
+var wf_senddown(C:client)    : bool      # senddowngradeRule
+var wf_clientinv(C:client)   : bool      # clientinvalidatesRule
+var wf_clientdown(C:client)  : bool      # clientdowngradesRule
+var wf_recvinvack(C:client)  : bool      # receiveinvalidateAckRule
+var wf_recvdownack(C:client) : bool      # receivedowngradeAckRule
+var wf_recvshared(C:client)  : bool      # receivesharedGrantRule
+var wf_recvexcl(C:client)    : bool      # receiveexclusiveGrantRule
+var wf_recvmod(C:client)     : bool      # receivemodifiedGrantRule
+var wf_grantshared           : bool      # grantsharedRule
+var wf_grantexcl             : bool      # grantexclusiveRule
+var wf_grantmod              : bool      # grantmodifiedRule
+
+after init {
+    s.channel1(C)   := empty1;
+    s.channel2_4(C) := empty2_4;
+    s.channel3(C)   := empty3;
+    s.cache(C)      := invalid;
+    s.homeSharerList(C) := false;
+    s.homeprobeList(C)  := false;
+    s.homeexclusiveGranted := false;
+    s.homeCurrentCommand   := empty1;
+    s.waiting(C) := false;
+
+    wf_pick(C) := false;
+    f_pick(C)  := false;
+    wf_sendinv(C)     := false;
+    wf_senddown(C)    := false;
+    wf_clientinv(C)   := false;
+    wf_clientdown(C)  := false;
+    wf_recvinvack(C)  := false;
+    wf_recvdownack(C) := false;
+    wf_recvshared(C)  := false;
+    wf_recvexcl(C)    := false;
+    wf_recvmod(C)     := false;
+    wf_grantshared := false;
+    wf_grantexcl   := false;
+    wf_grantmod    := false;
+}
+
+# ---------------------------------------------------------------------------
+# Client-side request generation.  These are *environment* actions: we assume
+# no fairness for them, since we never want to force a cache to issue a
+# request.  A cache blocks until its previous access has been served.
+# ---------------------------------------------------------------------------
+
+action reqsharedRule(cl:client) = {
+    require ~s.waiting(cl);
+    require s.cache(cl) = invalid & s.channel1(cl) = empty1;
+    s.channel1(cl) := reqshared;
+    s.waiting(cl) := true;
+}
+
+action reqexclusiveRule(cl:client) = {
+    require ~s.waiting(cl);
+    require (s.cache(cl) = invalid | s.cache(cl) = shared | s.cache(cl) = owned)
+            & s.channel1(cl) = empty1;
+    s.channel1(cl) := reqexclusive;
+    s.waiting(cl) := true;
+}
+
+# MESI/MOESI silent upgrade E -> M: no bus traffic, no directory change.
+action writeExclusiveRule(cl:client) = {
+    require s.cache(cl) = exclusive;
+    s.cache(cl) := modified;
+}
+
+# ---------------------------------------------------------------------------
+# Home directory
+# ---------------------------------------------------------------------------
+
+# The arbiter of MOESI as literally specified: pick an *arbitrary* client with
+# a pending request.  `wf_pick(cl)` is pulsed before the guard (the scheduler
+# offered this pick a turn); `f_pick(cl)` is pulsed inside it (the pick
+# actually happened) and is the "taken" half of the compassion assumption.
+action pickNewRequestRule(cl:client) = {
+    wf_pick(cl) := true;
+    wf_pick(cl) := false;
+    if s.homeCurrentCommand = empty1 & s.channel1(cl) ~= empty1 {
+        f_pick(cl) := true;
+        f_pick(cl) := false;
+        s.homeCurrentCommand := s.channel1(cl);
+        s.channel1(cl) := empty1;
+        s.homeCurrentclient := cl;
+        s.homeprobeList(C) := s.homeSharerList(C);
+    }
+}
+
+action sendinvalidateRule(cl:client) = {
+    wf_sendinv(cl) := true;
+    wf_sendinv(cl) := false;
+    if s.channel2_4(cl) = empty2_4 & s.homeprobeList(cl)
+       & s.homeCurrentCommand = reqexclusive {
+        s.channel2_4(cl) := invalidate;
+        s.homeprobeList(cl) := false;
+    }
+}
+
+action senddowngradeRule(cl:client) = {
+    wf_senddown(cl) := true;
+    wf_senddown(cl) := false;
+    if s.channel2_4(cl) = empty2_4 & s.homeprobeList(cl)
+       & s.homeCurrentCommand = reqshared & s.homeexclusiveGranted {
+        s.channel2_4(cl) := downgrade;
+        s.homeprobeList(cl) := false;
+    }
+}
+
+action receiveinvalidateAckRule(cl:client) = {
+    wf_recvinvack(cl) := true;
+    wf_recvinvack(cl) := false;
+    if s.homeCurrentCommand ~= empty1 & s.channel3(cl) = invalidateAck {
+        s.homeSharerList(cl) := false;
+        s.homeexclusiveGranted := false;
+        s.channel3(cl) := empty3;
+    }
+}
+
+action receivedowngradeAckRule(cl:client) = {
+    wf_recvdownack(cl) := true;
+    wf_recvdownack(cl) := false;
+    if s.homeCurrentCommand ~= empty1 & s.channel3(cl) = downgradeAck {
+        s.homeexclusiveGranted := false;
+        s.channel3(cl) := empty3;
+    }
+}
+
+action grantsharedRule = {
+    wf_grantshared := true;
+    wf_grantshared := false;
+    if s.homeCurrentCommand = reqshared
+       & ~s.homeexclusiveGranted
+       & (exists I. s.homeSharerList(I))
+       & s.channel2_4(s.homeCurrentclient) = empty2_4 {
+        s.homeSharerList(s.homeCurrentclient) := true;
+        s.homeCurrentCommand := empty1;
+        s.channel2_4(s.homeCurrentclient) := grantshared;
+    }
+}
+
+action grantexclusiveRule = {
+    wf_grantexcl := true;
+    wf_grantexcl := false;
+    if s.homeCurrentCommand = reqshared
+       & (forall I. ~s.homeSharerList(I))
+       & s.channel2_4(s.homeCurrentclient) = empty2_4 {
+        s.homeSharerList(s.homeCurrentclient) := true;
+        s.homeexclusiveGranted := true;
+        s.homeCurrentCommand := empty1;
+        s.channel2_4(s.homeCurrentclient) := grantexclusive;
+        owner := s.homeCurrentclient;
+    }
+}
+
+action grantmodifiedRule = {
+    wf_grantmod := true;
+    wf_grantmod := false;
+    if s.homeCurrentCommand = reqexclusive
+       & (forall I. ~s.homeSharerList(I))
+       & s.channel2_4(s.homeCurrentclient) = empty2_4 {
+        s.homeSharerList(s.homeCurrentclient) := true;
+        s.homeexclusiveGranted := true;
+        s.homeCurrentCommand := empty1;
+        s.channel2_4(s.homeCurrentclient) := grantmodified;
+        owner := s.homeCurrentclient;
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Client-side probe handling and grant reception
+# ---------------------------------------------------------------------------
+
+action clientinvalidatesRule(cl:client) = {
+    wf_clientinv(cl) := true;
+    wf_clientinv(cl) := false;
+    if s.channel2_4(cl) = invalidate & s.channel3(cl) = empty3 {
+        s.channel2_4(cl) := empty2_4;
+        s.channel3(cl)   := invalidateAck;
+        s.cache(cl)      := invalid;
+    }
+}
+
+action clientdowngradesRule(cl:client) = {
+    wf_clientdown(cl) := true;
+    wf_clientdown(cl) := false;
+    if s.channel2_4(cl) = downgrade & s.channel3(cl) = empty3 {
+        s.channel2_4(cl) := empty2_4;
+        s.channel3(cl)   := downgradeAck;
+        if s.cache(cl) = modified {
+            s.cache(cl) := owned;       # MOESI dirty sharing: no writeback
+        } else if s.cache(cl) = exclusive {
+            s.cache(cl) := shared;
+        }
+    }
+}
+
+action receivesharedGrantRule(cl:client) = {
+    wf_recvshared(cl) := true;
+    wf_recvshared(cl) := false;
+    if s.channel2_4(cl) = grantshared {
+        s.cache(cl) := shared;
+        s.channel2_4(cl) := empty2_4;
+        s.waiting(cl) := false;
+    }
+}
+
+action receiveexclusiveGrantRule(cl:client) = {
+    wf_recvexcl(cl) := true;
+    wf_recvexcl(cl) := false;
+    if s.channel2_4(cl) = grantexclusive {
+        s.cache(cl) := exclusive;
+        s.channel2_4(cl) := empty2_4;
+        s.waiting(cl) := false;
+    }
+}
+
+action receivemodifiedGrantRule(cl:client) = {
+    wf_recvmod(cl) := true;
+    wf_recvmod(cl) := false;
+    if s.channel2_4(cl) = grantmodified {
+        s.cache(cl) := modified;
+        s.channel2_4(cl) := empty2_4;
+        s.waiting(cl) := false;
+    }
+}
+
+export reqsharedRule
+export reqexclusiveRule
+export writeExclusiveRule
+export pickNewRequestRule
+export sendinvalidateRule
+export senddowngradeRule
+export clientinvalidatesRule
+export clientdowngradesRule
+export receiveinvalidateAckRule
+export receivedowngradeAckRule
+export grantsharedRule
+export grantexclusiveRule
+export grantmodifiedRule
+export receivesharedGrantRule
+export receiveexclusiveGrantRule
+export receivemodifiedGrantRule
+
+# ---------------------------------------------------------------------------
+# The fairness flags are only momentarily true.
+# ---------------------------------------------------------------------------
+
+invariant ~wf_pick(C)
+invariant ~f_pick(C)
+invariant ~wf_sendinv(C)
+invariant ~wf_senddown(C)
+invariant ~wf_clientinv(C)
+invariant ~wf_clientdown(C)
+invariant ~wf_recvinvack(C)
+invariant ~wf_recvdownack(C)
+invariant ~wf_recvshared(C)
+invariant ~wf_recvexcl(C)
+invariant ~wf_recvmod(C)
+invariant ~wf_grantshared
+invariant ~wf_grantexcl
+invariant ~wf_grantmod
+
+# ===========================================================================
+# SAFETY: the MOESI compatibility table (proved in moesi.ivy; repeated here
+# because the liveness argument runs on top of these invariants)
+# ===========================================================================
+
+invariant [moesi_M_is_exclusive]
+    forall C1, C2. C1 ~= C2 & s.cache(C1) = modified -> s.cache(C2) = invalid
+
+invariant [moesi_E_is_exclusive]
+    forall C1, C2. C1 ~= C2 & s.cache(C1) = exclusive -> s.cache(C2) = invalid
+
+invariant [moesi_O_compatible_with_S_only]
+    forall C1, C2. C1 ~= C2 & s.cache(C1) = owned
+        -> s.cache(C2) = shared | s.cache(C2) = invalid
+
+invariant [moesi_O_is_unique]
+    forall C1, C2. s.cache(C1) = owned & s.cache(C2) = owned -> C1 = C2
+
+invariant [excl_unique]
+    s.homeexclusiveGranted & s.homeSharerList(C) -> C = owner
+
+invariant [excl_owner_is_sharer]
+    s.homeexclusiveGranted -> s.homeSharerList(owner)
+
+invariant [shared_implies_no_writer]
+    (s.cache(C) = shared | s.channel2_4(C) = grantshared)
+        -> s.homeSharerList(C)
+           & (~s.homeexclusiveGranted | s.channel3(C) = downgradeAck)
+
+invariant [writable_is_owner]
+    (s.cache(C) = exclusive | s.cache(C) = modified
+     | s.channel2_4(C) = grantexclusive | s.channel2_4(C) = grantmodified)
+        -> s.homeSharerList(C) & s.homeexclusiveGranted & C = owner
+
+invariant [owned_is_owner]
+    s.cache(C) = owned -> s.homeSharerList(C) & C = owner
+
+invariant [owned_not_writable]
+    s.cache(C) = owned & s.homeexclusiveGranted -> s.channel3(C) = downgradeAck
+
+invariant [probe_implies_sharer]
+    s.homeprobeList(C) -> s.homeSharerList(C)
+
+invariant [invalidate_in_channel]
+    s.channel2_4(C) = invalidate
+        -> s.homeCurrentCommand = reqexclusive
+           & s.homeSharerList(C) & ~s.homeprobeList(C)
+
+invariant [downgrade_in_channel]
+    s.channel2_4(C) = downgrade
+        -> s.homeCurrentCommand = reqshared & s.homeexclusiveGranted
+           & s.homeSharerList(C) & ~s.homeprobeList(C) & C = owner
+
+invariant [invalidateAck_in_channel]
+    s.channel3(C) = invalidateAck
+        -> s.cache(C) = invalid & s.homeCurrentCommand = reqexclusive
+           & s.homeSharerList(C) & ~s.homeprobeList(C)
+
+invariant [downgradeAck_in_channel]
+    s.channel3(C) = downgradeAck
+        -> s.homeCurrentCommand = reqshared & s.homeexclusiveGranted
+           & s.homeSharerList(C) & ~s.homeprobeList(C) & C = owner
+           & s.cache(C) ~= exclusive & s.cache(C) ~= modified
+
+invariant [no_overlap]
+    s.channel2_4(C) ~= empty2_4 -> s.channel3(C) = empty3
+
+invariant [valid_implies_sharer]
+    s.cache(C) ~= invalid -> s.homeSharerList(C)
+
+# ===========================================================================
+# Extra invariants needed by the liveness argument
+# ===========================================================================
+
+# A waiting client is in exactly one of the three stages.  This is what
+# discharges S4 ("something is always scheduled").
+invariant [waiting_stages]
+    s.waiting(C) <-> (s.channel1(C) ~= empty1
+                      | (s.homeCurrentCommand ~= empty1 & s.homeCurrentclient = C)
+                      | s.channel2_4(C) = grantshared
+                      | s.channel2_4(C) = grantexclusive
+                      | s.channel2_4(C) = grantmodified)
+
+invariant [stage1_excl]
+    s.channel1(C) ~= empty1 ->
+        ~(s.homeCurrentCommand ~= empty1 & s.homeCurrentclient = C)
+        & s.channel2_4(C) ~= grantshared
+        & s.channel2_4(C) ~= grantexclusive
+        & s.channel2_4(C) ~= grantmodified
+
+invariant [stage2_excl]
+    (s.homeCurrentCommand ~= empty1 & s.homeCurrentclient = C) ->
+        s.channel2_4(C) ~= grantshared
+        & s.channel2_4(C) ~= grantexclusive
+        & s.channel2_4(C) ~= grantmodified
+
+# During a write command, a sharer already taken off the probe list has its
+# invalidate (or the ack) in flight: no sharer is ever stuck outside the
+# pipeline.  Without this, S4 has a hole.
+invariant [inv_in_flight]
+    s.homeCurrentCommand = reqexclusive
+    & s.homeSharerList(C) & ~s.homeprobeList(C)
+    -> s.channel2_4(C) = invalidate | s.channel3(C) = invalidateAck
+
+# Same for the downgrade pipeline of a read command.
+invariant [down_in_flight]
+    s.homeCurrentCommand = reqshared & s.homeexclusiveGranted
+    & s.homeSharerList(C) & ~s.homeprobeList(C)
+    -> s.channel2_4(C) = downgrade | s.channel3(C) = downgradeAck
+
+
+# ===========================================================================
+# Fairness assumptions: weak fairness (justice) for every rule.
+# ===========================================================================
+
+# Weak fairness for the arbiter is stated for completeness but is NOT used by
+# the proof: see [sf_pick] -- weak fairness of the pick is not enough.
+explicit temporal axiom [wfa_pick]        forall C. globally eventually wf_pick(C)
+
+# ---------------------------------------------------------------------------
+# Strong fairness (compassion) for the home's request arbiter:
+#
+#     if C's request is available for picking infinitely often,
+#     then the home eventually picks it.
+#
+# This does not assume the conclusion -- the antecedent still has to be
+# discharged, and that is exactly what the pipeline components [05]..[16] do:
+# they show the home keeps finishing commands, so C's request keeps becoming
+# pickable.
+# ---------------------------------------------------------------------------
+explicit temporal axiom [sf_pick]
+  forall C. (globally eventually (s.homeCurrentCommand = empty1 & s.channel1(C) ~= empty1))
+            -> (globally eventually f_pick(C))
+explicit temporal axiom [wfa_sendinv]     forall C. globally eventually wf_sendinv(C)
+explicit temporal axiom [wfa_senddown]    forall C. globally eventually wf_senddown(C)
+explicit temporal axiom [wfa_clientinv]   forall C. globally eventually wf_clientinv(C)
+explicit temporal axiom [wfa_clientdown]  forall C. globally eventually wf_clientdown(C)
+explicit temporal axiom [wfa_recvinvack]  forall C. globally eventually wf_recvinvack(C)
+explicit temporal axiom [wfa_recvdownack] forall C. globally eventually wf_recvdownack(C)
+explicit temporal axiom [wfa_recvshared]  forall C. globally eventually wf_recvshared(C)
+explicit temporal axiom [wfa_recvexcl]    forall C. globally eventually wf_recvexcl(C)
+explicit temporal axiom [wfa_recvmod]     forall C. globally eventually wf_recvmod(C)
+explicit temporal axiom [wfa_grantshared] globally eventually wf_grantshared
+explicit temporal axiom [wfa_grantexcl]   globally eventually wf_grantexcl
+explicit temporal axiom [wfa_grantmod]    globally eventually wf_grantmod
+
+# ===========================================================================
+# THE LIVENESS PROPERTY
+# ===========================================================================
+
+explicit temporal property [live]
+  forall C. globally (s.waiting(C) -> eventually ~s.waiting(C))
+proof {
+  tactic skolemizenp;
+  instantiate sf_pick with C = _C;
+  instantiate wfa_sendinv;
+  instantiate wfa_senddown;
+  instantiate wfa_clientinv;
+  instantiate wfa_clientdown;
+  instantiate wfa_recvinvack;
+  instantiate wfa_recvdownack;
+  instantiate wfa_recvshared;
+  instantiate wfa_recvexcl;
+  instantiate wfa_recvmod;
+  instantiate wfa_grantshared;
+  instantiate wfa_grantexcl;
+  instantiate wfa_grantmod;
+  tactic ranking with {
+
+    # ===== stage 1 ========================================================
+    #
+    # Abbreviate the compassion antecedent
+    #
+    #     E  =  homeCurrentCommand = empty1 & channel1(_C) ~= empty1
+    #
+    # Following McMillan's `strongfair.ivy` idiom, the symbolic tableau for E
+    # splits stage 1 into three cases:
+    #   * E holds infinitely often               -> [01], compassion delivers
+    #                                               the pick
+    #   * E holds finitely often, last E not yet -> [00], the tableau bit
+    #                                               itself is the ranking and
+    #                                               must drop to false
+    #   * E never happens again                  -> the home is never idle
+    #                                               again, so the pipeline
+    #                                               [05]..[16] is required, and
+    #                                               it drives the home to a
+    #                                               grant -- which makes it
+    #                                               idle.  Contradiction.
+
+    # [00] E happens only finitely often, but the last E has not happened yet.
+    definition work_created[00](N:client) = true
+    definition work_needed[00](N:client)  = eventually (s.homeCurrentCommand = empty1
+                                                        & s.channel1(_C) ~= empty1)
+    definition work_invar[00]             = s.waiting(_C)
+    definition work_progress[00](N:client)= ~(eventually (s.homeCurrentCommand = empty1
+                                                          & s.channel1(_C) ~= empty1))
+    definition work_helpful[00](N:client) = ~(globally eventually (s.homeCurrentCommand = empty1
+                                                                   & s.channel1(_C) ~= empty1))
+                                            & (eventually (s.homeCurrentCommand = empty1
+                                                           & s.channel1(_C) ~= empty1))
+
+    # [01] E happens infinitely often, so by compassion the home eventually
+    # picks _C's request and empties channel1(_C).
+    definition work_created[01](N:client) = true
+    definition work_needed[01](N:client)  = s.channel1(_C) ~= empty1
+    definition work_invar[01]             = s.waiting(_C)
+    definition work_progress[01](N:client)= f_pick(_C)
+    definition work_helpful[01](N:client) = (globally eventually (s.homeCurrentCommand = empty1
+                                                                  & s.channel1(_C) ~= empty1))
+                                            & s.channel1(_C) ~= empty1
+
+    # ===== stage 3: _C consumes its grant =================================
+    definition work_created[02](N:client) = true
+    definition work_needed[02](N:client)  = s.waiting(_C)
+    definition work_invar[02]             = s.waiting(_C)
+    definition work_progress[02](N:client)= wf_recvshared(N)
+    definition work_helpful[02](N:client) = N = _C & s.channel2_4(_C) = grantshared
+
+    definition work_created[03](N:client) = true
+    definition work_needed[03](N:client)  = s.waiting(_C)
+    definition work_invar[03]             = s.waiting(_C)
+    definition work_progress[03](N:client)= wf_recvexcl(N)
+    definition work_helpful[03](N:client) = N = _C & s.channel2_4(_C) = grantexclusive
+
+    definition work_created[04](N:client) = true
+    definition work_needed[04](N:client)  = s.waiting(_C)
+    definition work_invar[04]             = s.waiting(_C)
+    definition work_progress[04](N:client)= wf_recvmod(N)
+    definition work_helpful[04](N:client) = N = _C & s.channel2_4(_C) = grantmodified
+
+    # ===== stage 2a: the invalidation pipeline (write requests) ===========
+    #
+    #   sharer --sendinvalidate--> invalidate in ch2_4
+    #          --clientinvalidates--> invalidateAck in ch3
+    #          --receiveinvalidateAck--> off the sharer list
+    #
+    # Each ranking is a superset of the stages still to come, so the rule
+    # that advances a client conserves it.
+
+    definition work_created[05](N:client) = true
+    definition work_needed[05](N:client)  = s.homeSharerList(N)
+                                            & s.homeCurrentCommand ~= empty1
+    definition work_invar[05]             = s.waiting(_C)
+    definition work_progress[05](N:client)= wf_recvinvack(N)
+    definition work_helpful[05](N:client) = s.channel3(N) = invalidateAck
+
+    definition work_created[06](N:client) = true
+    definition work_needed[06](N:client)  = s.homeSharerList(N)
+                                            & s.homeCurrentCommand ~= empty1
+                                            & s.channel3(N) ~= invalidateAck
+    definition work_invar[06]             = s.waiting(_C)
+    definition work_progress[06](N:client)= wf_clientinv(N)
+    definition work_helpful[06](N:client) = s.channel2_4(N) = invalidate
+
+    definition work_created[07](N:client) = true
+    definition work_needed[07](N:client)  = s.homeSharerList(N)
+                                            & s.homeCurrentCommand ~= empty1
+                                            & s.channel3(N) ~= invalidateAck
+                                            & s.channel2_4(N) ~= invalidate
+    definition work_invar[07]             = s.waiting(_C)
+    definition work_progress[07](N:client)= wf_sendinv(N)
+    definition work_helpful[07](N:client) = s.homeprobeList(N)
+                                            & s.channel2_4(N) = empty2_4
+                                            & s.homeCurrentCommand = reqexclusive
+
+    # ===== stage 2b: the downgrade pipeline (read requests) ===============
+    #
+    # This is the MOESI-specific half.  A read request that finds the line
+    # writable somewhere does not invalidate it -- it downgrades the owner
+    # (M -> O, or E -> S) and the owner keeps the data.  The ranking is
+    # "write permission is still outstanding for this read command"; it is
+    # the same three-stage shape as above.
+
+    definition work_created[08](N:client) = true
+    definition work_needed[08](N:client)  = s.homeexclusiveGranted
+                                            & s.homeCurrentCommand = reqshared
+    definition work_invar[08]             = s.waiting(_C)
+    definition work_progress[08](N:client)= wf_recvdownack(N)
+    definition work_helpful[08](N:client) = s.channel3(N) = downgradeAck
+
+    definition work_created[09](N:client) = true
+    definition work_needed[09](N:client)  = s.homeexclusiveGranted
+                                            & s.homeCurrentCommand = reqshared
+                                            & s.channel3(N) ~= downgradeAck
+    definition work_invar[09]             = s.waiting(_C)
+    definition work_progress[09](N:client)= wf_clientdown(N)
+    definition work_helpful[09](N:client) = s.channel2_4(N) = downgrade
+
+    definition work_created[10](N:client) = true
+    definition work_needed[10](N:client)  = s.homeexclusiveGranted
+                                            & s.homeCurrentCommand = reqshared
+                                            & s.channel3(N) ~= downgradeAck
+                                            & s.channel2_4(N) ~= downgrade
+    definition work_invar[10]             = s.waiting(_C)
+    definition work_progress[10](N:client)= wf_senddown(N)
+    definition work_helpful[10](N:client) = s.homeprobeList(N)
+                                            & s.channel2_4(N) = empty2_4
+                                            & s.homeCurrentCommand = reqshared
+                                            & s.homeexclusiveGranted
+
+    # ===== stage 2c: drain a stale grant that blocks a probe ==============
+    #
+    # A client that has not yet consumed its own grant occupies channel2_4,
+    # which blocks the probe the home needs to send it.  Draining it is a
+    # genuine pipeline stage.
+
+    definition work_created[11](N:client) = true
+    definition work_needed[11](N:client)  = s.channel2_4(N) = grantshared
+                                            & (s.homeCurrentCommand = reqexclusive
+                                               | (s.homeCurrentCommand = reqshared
+                                                  & s.homeexclusiveGranted))
+    definition work_invar[11]             = s.waiting(_C)
+    definition work_progress[11](N:client)= wf_recvshared(N)
+    definition work_helpful[11](N:client) = s.channel2_4(N) = grantshared
+                                            & (s.homeCurrentCommand = reqexclusive
+                                               | (s.homeCurrentCommand = reqshared
+                                                  & s.homeexclusiveGranted))
+
+    definition work_created[12](N:client) = true
+    definition work_needed[12](N:client)  = s.channel2_4(N) = grantexclusive
+                                            & (s.homeCurrentCommand = reqexclusive
+                                               | (s.homeCurrentCommand = reqshared
+                                                  & s.homeexclusiveGranted))
+    definition work_invar[12]             = s.waiting(_C)
+    definition work_progress[12](N:client)= wf_recvexcl(N)
+    definition work_helpful[12](N:client) = s.channel2_4(N) = grantexclusive
+                                            & (s.homeCurrentCommand = reqexclusive
+                                               | (s.homeCurrentCommand = reqshared
+                                                  & s.homeexclusiveGranted))
+
+    definition work_created[13](N:client) = true
+    definition work_needed[13](N:client)  = s.channel2_4(N) = grantmodified
+                                            & (s.homeCurrentCommand = reqexclusive
+                                               | (s.homeCurrentCommand = reqshared
+                                                  & s.homeexclusiveGranted))
+    definition work_invar[13]             = s.waiting(_C)
+    definition work_progress[13](N:client)= wf_recvmod(N)
+    definition work_helpful[13](N:client) = s.channel2_4(N) = grantmodified
+                                            & (s.homeCurrentCommand = reqexclusive
+                                               | (s.homeCurrentCommand = reqshared
+                                                  & s.homeexclusiveGranted))
+
+    # ===== stage 2d: the home issues the grant, ending the command ========
+
+    definition work_created[14](N:client) = true
+    definition work_needed[14](N:client)  = s.homeCurrentCommand ~= empty1
+    definition work_invar[14]             = s.waiting(_C)
+    definition work_progress[14](N:client)= wf_grantshared
+    definition work_helpful[14](N:client) = s.homeCurrentCommand = reqshared
+                                            & ~s.homeexclusiveGranted
+                                            & (exists I. s.homeSharerList(I))
+                                            & s.channel2_4(s.homeCurrentclient) = empty2_4
+
+    definition work_created[15](N:client) = true
+    definition work_needed[15](N:client)  = s.homeCurrentCommand ~= empty1
+    definition work_invar[15]             = s.waiting(_C)
+    definition work_progress[15](N:client)= wf_grantexcl
+    definition work_helpful[15](N:client) = s.homeCurrentCommand = reqshared
+                                            & (forall I. ~s.homeSharerList(I))
+                                            & s.channel2_4(s.homeCurrentclient) = empty2_4
+
+    definition work_created[16](N:client) = true
+    definition work_needed[16](N:client)  = s.homeCurrentCommand ~= empty1
+    definition work_invar[16]             = s.waiting(_C)
+    definition work_progress[16](N:client)= wf_grantmod
+    definition work_helpful[16](N:client) = s.homeCurrentCommand = reqexclusive
+                                            & (forall I. ~s.homeSharerList(I))
+                                            & s.channel2_4(s.homeCurrentclient) = empty2_4
+
+    # The compassion assumption, re-stated as a state invariant of the
+    # tableau.  `instantiate sf_pick` only pins it at the initial state, but
+    # `l2s_progress_eventually[01]` is a postcondition checked at every state.
+    # The lift is sound because []<>p is insensitive to finite prefixes, and it
+    # is inductive from the local tableau constraints -- Ivy proves it, you
+    # just have to ask.  (Same line as in McMillan's `strongfair.ivy`.)
+    invariant (globally eventually (s.homeCurrentCommand = empty1
+                                    & s.channel1(_C) ~= empty1))
+              -> (globally eventually f_pick(_C))
+  }
+}

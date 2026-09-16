@@ -33,6 +33,8 @@ relation (X:node < Y:node)
 axiom [node_trans] (X:node < Y & Y < Z) -> X < Z
 axiom [node_asym]  ~(X:node < Y & Y < X)
 axiom [node_total] X:node < Y | X = Y | Y < X
+relation (X:node <= Y:node)
+definition (X:node <= Y:node) = (X < Y | X = Y)
 
 # ---- logical timestamps -----------------------------------------------------
 
@@ -75,10 +77,30 @@ var rcvd(N:node, X:node) : ts
 var last_ts : ts
 var last_node : node
 
+# replied(S,D) / lastrel(S,D) : ghost.  The timestamp of the last *reply* and
+# the last *release* S sent to D (0 if none).  `lastrr` is the later of the
+# two: the timestamp of the last message S sent D that can unblock D --
+# a reply satisfies D's "heard a later reply from everyone" test, a release
+# clears D's request queue.  Ranking [03] drains exactly the channel prefix up
+# to `lastrr`.
+var replied(S:node, D:node) : ts
+var lastrel(S:node, D:node) : ts
+
+function lastrr(S:node, D:node) = ts.max2(replied(S,D), lastrel(S,D))
+
 # ---- lexicographic order on (timestamp, node) -------------------------------
 
 function lexord(T1:ts, N1:node, T2:ts, N2:node) =
     T1 < T2 | (T1 = T2 & N1 < N2)
+
+function lexle(T1:ts, N1:node, T2:ts, N2:node) =
+    T1 < T2 | (T1 = T2 & (N1 = N2 | N1 < N2))
+
+# X is pending with a request at or before (T,C) in the global (timestamp,id)
+# order -- "X is ahead of, or is, the node we are tracking".
+relation aheadeq(X:node, T:ts, C:node) =
+    st(X) ~= idle & lexle(req(X,X), X, T, C)
+
 
 # ---- fairness flags ---------------------------------------------------------
 #
@@ -86,6 +108,24 @@ function lexord(T1:ts, N1:node, T2:ts, N2:node) =
 # guard, so that a turn offered to a disabled rule is a stutter step and
 # `globally eventually wf_x` is an honest statement about the scheduler
 # (LIVENESS_CASE_STUDY_GERMAN.md section 3).
+
+# blocked(N) : N's cached answer to "is some peer still holding me up?".  A
+# node recomputes it every time its own view of a peer changes; `check_cs`
+# then just reads the flag.  Caching the test is an implementation detail, but
+# it is also what keeps the proof inside the decidable fragment: the
+# `work_helpful` of ranking [04] has to name the entry guard, and a guard
+# written as a quantified formula puts a forall under a negation and takes the
+# verification condition out of FAU (LIVENESS_GUIDE.md section 4.5).
+relation blocked(N:node)
+
+# front / has_front : the pending node whose request is least in the global
+# (timestamp, id) order, exactly as `bakery.ivy` tracks the least ticket.
+# It has to be a *nullary* symbol: the scheduler of ranking [04] has to point
+# at the node that can actually enter, and a node-indexed witness function
+# would put a node -> node arc in the stratification graph and take the
+# verification condition out of FAU.
+var front : node
+relation has_front
 
 relation wf_recv(S:node, D:node)
 relation wf_check(N:node)
@@ -97,12 +137,31 @@ after init {
     req(N,X) := 0;
     rep(N,X) := 0;
     rcvd(N,X) := 0;
+    replied(S,D) := 0;
+    lastrel(S,D) := 0;
     chan(S,D,K,T) := false;
     last_ts := 0;
-    last_node := 0;
+    blocked(N) := false;
+    has_front := false;
     wf_recv(S,D) := false;
     wf_check(N) := false;
     wf_exit(N) := false;
+}
+
+# ---------------------------------------------------------------------------
+# refresh(n) -- recompute n's `blocked` flag.  n is held up by a peer y if y
+# has a request in n's queue that is ordered before n's own, or if n has not
+# yet heard a reply from y later than its own request.
+# ---------------------------------------------------------------------------
+
+action refresh(n:node) = {
+    if some y:node. y ~= n
+         & ((req(n,y) ~= 0 & ~lexord(req(n,n),n,req(n,y),y))
+            | rep(n,y) <= req(n,n)) {
+        blocked(n) := true;
+    } else {
+        blocked(n) := false;
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -121,6 +180,12 @@ action request_cs(n:node) = {
         req(n,n) := t;
         chan(n,D,request,t) := (D ~= n) | chan(n,D,request,t);
         st(n) := waiting;
+        refresh(n);
+        if ~has_front | lexord(req(n,n),n,req(front,front),front) {
+            front := n;
+            has_front := true;
+        };
+        refresh(front);
     }
 }
 
@@ -145,11 +210,13 @@ action recv(s:node, d:node) = {
         if isreq {
             req(d,s) := t;
             chan(d,s,reply,nt) := true;
+            replied(d,s) := nt;
         } else if isrel {
             req(d,s) := 0;
         } else if isrep {
             rep(d,s) := t;
-        }
+        };
+        refresh(d);
     }
 }
 
@@ -160,10 +227,7 @@ action recv(s:node, d:node) = {
 action check_cs(n:node) = {
     wf_check(n) := true;
     wf_check(n) := false;
-    if st(n) = waiting
-       & (forall X. X = n | req(n,X) = 0 | lexord(req(n,n),n,req(n,X),X))
-       & (forall X. X = n | rep(n,X) > req(n,n))
-    {
+    if st(n) = waiting & ~blocked(n) {
         st(n) := critical;
     }
 }
@@ -182,7 +246,18 @@ action exit_cs(n:node) = {
         last_node := n;
         req(n,n) := 0;
         chan(n,D,release,t) := (D ~= n) | chan(n,D,release,t);
+        lastrel(n,D) := (t if D ~= n else lastrel(n,D));
         st(n) := idle;
+        refresh(n);
+        if some f:node. st(f) ~= idle minimizing req(f,f) {
+            if some g:node. st(g) ~= idle & req(g,g) = req(f,f) minimizing g {
+                front := g;
+                has_front := true;
+                refresh(g);
+            }
+        } else {
+            has_front := false;
+        };
     }
 }
 
@@ -202,8 +277,14 @@ invariant [fair_flags_low3] ~wf_exit(N)
 invariant [no_self_msg] ~chan(S,S,K,T)
 
 invariant [msg_below_clock] chan(S,D,K,T) -> T <= clock(S)
+# every message a node sends carries a strictly fresher timestamp, so a
+# timestamp identifies a message within a channel
+invariant [one_kind] chan(S,D,K1,T) & chan(S,D,K2,T) -> K1 = K2
 invariant [req_below_clock] req(D,S) <= clock(S)
 invariant [rep_below_clock] rep(D,S) <= clock(S)
+invariant [rep_below_own_clock]  rep(S,D)  <= clock(S)
+invariant [rcvd_below_own_clock] rcvd(S,D) <= clock(S)
+invariant [no_self_state] rep(N,N) = 0 & rcvd(N,N) = 0
 invariant [rcvd_below_clock] rcvd(D,S) <= clock(S)
 invariant [last_mint] clock(last_node) = last_ts
 
@@ -225,7 +306,88 @@ invariant [crit_least]
     st(S) = critical & D ~= S ->
         (req(S,D) = 0 | lexord(req(S,S),S,req(S,D),D))
 
+# The cached flag really does mean what `check_cs` needs it to mean.
+invariant [blocked_sound]
+    st(N) = waiting & ~blocked(N) & Y ~= N ->
+        ((req(N,Y) = 0 | lexord(req(N,N),N,req(N,Y),Y)) & rep(N,Y) > req(N,N))
+
+# `front` really is the least pending request.
+invariant [front_pending] has_front -> st(front) ~= idle
+invariant [front_exists]  st(Z) ~= idle -> has_front
+invariant [front_min]
+    has_front & st(Z) ~= idle & Z ~= front ->
+        lexord(req(front,front),front,req(Z,Z),Z)
+
+# The blocked flag of `front` comes with a witness.  `front` is nullary, so
+# this existential skolemizes to a constant and stays inside FAU.
+invariant [front_blocked_witness]
+    has_front & st(front) = waiting & blocked(front) ->
+        (exists Y. Y ~= front
+                   & ((req(front,Y) ~= 0
+                       & ~lexord(req(front,front),front,req(front,Y),Y))
+                      | rep(front,Y) <= req(front,front)))
+
 invariant [mutex] st(X) = critical & st(Y) = critical -> X = Y
+
+# ---------------------------------------------------------------------------
+# Further invariants, needed only by the liveness argument.
+# ---------------------------------------------------------------------------
+
+invariant [replied_below_clock] replied(S,D) <= clock(S)
+invariant [no_self_ghost] replied(N,N) = 0 & lastrel(N,N) = 0
+invariant [lastrel_below_clock] lastrel(S,D) <= clock(S)
+
+# A reply is never later than the last timestamp taken off the channel, so
+# (with [fifo]) nothing already delivered can be undercut by a later arrival.
+invariant [rep_le_rcvd] rep(D,S) <= rcvd(D,S)
+
+# "One round at a time": a node has at most one request outstanding, and it
+# cannot start a new round until the old one has been delivered and answered
+# everywhere -- releasing requires every peer to have replied, and a peer only
+# replies to a request it has received.  These five invariants are what rules
+# out a node's own stale request lingering in a channel.
+invariant [rep_le_replied]   rep(S,D) <= replied(D,S)
+invariant [idle_no_request]  st(S) = idle -> ~chan(S,D,request,T)
+invariant [req_inflight_unreplied] chan(S,D,request,T) -> replied(D,S) < T
+invariant [reply_inflight_unheard]
+    chan(D,S,reply,Q) ->
+        (st(S) = waiting & rep(S,D) < req(S,S) & rcvd(D,S) >= req(S,S))
+invariant [one_reply_inflight]
+    chan(D,S,reply,Q1) & chan(D,S,reply,Q2) -> Q1 = Q2
+invariant [req_is_own] chan(S,D,request,T) & st(S) ~= idle -> T = req(S,S)
+
+# [aware] : once S's request has been delivered to D, D's clock is strictly
+# past it -- so every request D issues from then on is ordered *after* S's.
+# This is what makes the "nodes ahead of me" ranking [02] conserved.
+invariant [aware]
+    st(S) ~= idle & D ~= S & ~chan(S,D,request,req(S,S)) -> clock(D) > req(S,S)
+
+# ... and D has answered it.
+invariant [aware_replied]
+    st(S) ~= idle & D ~= S & ~chan(S,D,request,req(S,S)) -> replied(D,S) > req(S,S)
+
+# The last reply S sent D is either still in flight or has been recorded.
+invariant [replied_inflight]
+    replied(S,D) ~= 0 ->
+        (chan(S,D,reply,replied(S,D)) | rep(D,S) >= replied(S,D))
+
+# If D's request queue holds a request of S that S is no longer making, then
+# S's release is still on its way to D.  This is what lets a blocked node
+# always point at a message whose delivery unblocks it.
+invariant [stale_release]
+    D ~= S & req(D,S) ~= 0 & ~(st(S) ~= idle & req(S,S) = req(D,S)) ->
+        (chan(S,D,release,lastrel(S,D)) & lastrel(S,D) > req(D,S))
+
+invariant [stale_request]
+    chan(S,D,request,T) & ~(st(S) ~= idle & req(S,S) = T) ->
+        (chan(S,D,release,lastrel(S,D)) & lastrel(S,D) > T)
+
+# A node in its critical section holds the least request in the whole system
+# (not merely the least in its own queue).  This is the alternative form of
+# `crit_least` noted in lamport_mutex_man.ivy; it is what identifies the
+# critical node as one of the nodes "ahead of me".
+invariant [crit_global_least]
+    st(X) = critical & st(Y) ~= idle & Y ~= X -> lexord(req(X,X),X,req(Y,Y),Y)
 
 # ---------------------------------------------------------------------------
 # Fairness assumptions.
@@ -279,5 +441,125 @@ proof {
     definition work_invar          = chan(_S,_D,_K,_T)
     definition work_progress       = wf_recv(_S,_D)
     definition work_helpful        = exists K,T1. chan(_S,_D,K,T1) & T1 <= _T
+  }
+}
+
+# ---------------------------------------------------------------------------
+# The liveness property: every waiting node eventually enters its critical
+# section.
+#
+#     forall C,R. globally (st(C) = waiting & req(C,C) = R
+#                           -> eventually st(C) = critical)
+#
+# The request timestamp R is carried as a second Skolem constant so that every
+# ranking can talk about "(_R,_C)", the position of the tracked request in the
+# global (timestamp, id) order, without going through a state term.
+#
+# The proof is a single lexicographic ranking (Rule 10) with five components,
+# highest order first.  Writing r = _R for the tracked request:
+#
+#  [00] _C's own outgoing messages with timestamp <= r.
+#       Never grows: while _C waits it only ever sends replies, and those are
+#       stamped above its clock, which already dominates r.  Emptying it means
+#       every node has received _C's request.
+#
+#  [01] *every* message in flight with timestamp <= r.
+#       May grow, but only from a node whose clock is still below r, and by
+#       [aware] such a node has not yet received _C's request -- so [00] is
+#       scheduled, which is what licenses the growth under Rule 10.
+#       Emptying it means every request ordered at or before _C's has been
+#       delivered everywhere.
+#
+#  [02] the nodes whose request is at or before (r,_C).
+#       Reduced by exit_cs.  Its scheduler is just "somebody is in the
+#       critical section": by [crit_global_least] a critical node holds the
+#       least request in the system, hence is one of these nodes.  Grows only
+#       when a node with a clock below r issues a request, i.e. under [00].
+#
+#  [03] the messages that can unblock one of those nodes: everything in flight
+#       to such a node D up to `lastrr(S,D)`, the last reply-or-release S sent
+#       it.  A reply is what satisfies D's "heard a later reply" test, a
+#       release is what clears a stale entry from D's queue, so this is
+#       exactly the prefix D still has to consume.  `lastrr` advances only
+#       when S answers a request from D (whose timestamp is <= r, so [01] is
+#       scheduled) or when S leaves its critical section (so [02] is).
+#
+#  [04] those nodes that are still waiting.
+#       Reduced by check_cs once a node's entry test holds.  _C itself is one
+#       of them, so the only way for this ranking to stop shrinking is for _C
+#       to enter -- the goal.
+#
+# "Something is always scheduled" (premise S4, the `l2s_sched_exists` check)
+# is the heart of the argument: if none of the five schedulers is on, take F
+# to be the least node in [02].  F is waiting, F's request has been delivered
+# everywhere ([01] empty), every reply owed to F has arrived ([03] empty,
+# [replied_inflight]), and F's queue holds no stale earlier request
+# ([stale_release]) -- so F can enter and [04] is scheduled after all.
+# ---------------------------------------------------------------------------
+
+explicit temporal property [live]
+  forall C, R. globally ((st(C) = waiting & req(C,C) = R)
+                         -> eventually st(C) = critical)
+proof {
+  tactic skolemizenp;
+  instantiate wfa_recv;
+  instantiate wfa_check;
+  instantiate wfa_exit;
+  tactic ranking with {
+
+    definition work_created[00](S:node,D:node,T:ts) = (exists K. chan(S,D,K,T))
+    definition work_needed[00](S:node,D:node,T:ts)  = (exists K. chan(S,D,K,T)) & S = _C & T <= _R
+    definition work_invar[00]                       = st(_C) = waiting & req(_C,_C) = _R
+    definition work_progress[00](S:node,D:node)     = wf_recv(S,D)
+    definition work_helpful[00](S:node,D:node)      = S = _C & (exists K,T. chan(_C,D,K,T) & T <= _R)
+
+    definition work_created[01](S:node,D:node,T:ts) = (exists K. chan(S,D,K,T))
+    definition work_needed[01](S:node,D:node,T:ts)  = (exists K. chan(S,D,K,T)) & T <= _R
+    definition work_invar[01]                       = st(_C) = waiting & req(_C,_C) = _R
+    definition work_progress[01](S:node,D:node)     = wf_recv(S,D)
+    definition work_helpful[01](S:node,D:node)      = exists K,T. chan(S,D,K,T) & T <= _R
+
+    definition work_created[02](X:node)  = true
+    definition work_needed[02](X:node)   = aheadeq(X,_R,_C)
+    definition work_invar[02]            = st(_C) = waiting & req(_C,_C) = _R
+    definition work_progress[02](X:node) = wf_exit(X)
+    definition work_helpful[02](X:node)  = st(X) = critical
+
+    definition work_created[03](S:node,D:node,T:ts) = (exists K. chan(S,D,K,T))
+    definition work_needed[03](S:node,D:node,T:ts)  = (exists K. chan(S,D,K,T)) & aheadeq(D,_R,_C) & T <= lastrr(S,D)
+    definition work_invar[03]                       = st(_C) = waiting & req(_C,_C) = _R
+    definition work_progress[03](S:node,D:node)     = wf_recv(S,D)
+    definition work_helpful[03](S:node,D:node)      = aheadeq(D,_R,_C) & (exists K,T. chan(S,D,K,T) & T <= lastrr(S,D))
+
+    definition work_created[04](X:node)  = true
+    definition work_needed[04](X:node)   = aheadeq(X,_R,_C) & st(X) = waiting
+    definition work_invar[04]            = st(_C) = waiting & req(_C,_C) = _R
+    definition work_progress[04](X:node) = wf_check(X)
+    definition work_helpful[04](X:node)  = has_front & X = front & aheadeq(X,_R,_C) & st(X) = waiting & ~blocked(front)
+  }
+}
+
+# ---------------------------------------------------------------------------
+# Starvation freedom, stated without the auxiliary timestamp parameter:
+#
+#     every node waiting to enter its critical section eventually enters it.
+#
+# This is [live] with R instantiated at the tracked node's current request
+# timestamp; it needs no ranking of its own, so the ranking is trivial and all
+# the work is done by the progress condition (Rule 7, chaining liveness
+# lemmas).
+# ---------------------------------------------------------------------------
+
+explicit temporal property [starvation_freedom]
+  forall C. globally (st(C) = waiting -> eventually st(C) = critical)
+proof {
+  tactic skolemizenp;
+  instantiate live with C = _C;
+  tactic ranking with {
+    definition work_created = true
+    definition work_needed  = true
+    definition work_invar   = eventually st(_C) = critical
+    definition work_progress= st(_C) = critical
+    definition work_helpful = true
   }
 }

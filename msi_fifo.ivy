@@ -1,0 +1,580 @@
+#lang ivy1.8
+
+# ---------------------------------------------------------------------------
+# MSI cache coherence over a split-transaction snooping bus:
+# LIVENESS, with a FIFO bus arbiter, under weak fairness only.
+#
+# The model is `msi.ivy` (read that file first -- it documents the protocol
+# and carries the safety proof) plus
+#
+#   * fairness instrumentation on the seven bus-side rules,
+#   * request timestamps and a FIFO arbiter,
+#
+# and it proves
+#
+#       for every cache C:  globally ( waiting(C) -> eventually ~waiting(C) )
+#
+# i.e. every processor request -- a read miss, a write miss, or an upgrade --
+# eventually receives its data/permission and the cache installs the line.
+#
+# ---------------------------------------------------------------------------
+# WHY A FIFO ARBITER
+#
+# With an arbitrary arbiter the property is *false* under weak fairness.
+# `bus_arbitrate` needs an idle bus, and an adversarial scheduler can offer
+# cache C's turn only in cycles where the bus is busy with somebody else,
+# forever.  `msi_lex.ivy` proves the property for the arbitrary arbiter by
+# assuming compassion (strong fairness) for it.  Here we pay for liveness in
+# the model instead: requests carry logical timestamps and the arbiter serves
+# the oldest.  `bus_arbitrate` then becomes *unparameterized*, its guard ("the
+# bus is idle and somebody is queued") is stable, and plain weak fairness
+# suffices.  The two results are incomparable.
+#
+# ---------------------------------------------------------------------------
+# THE PROOF
+#
+# A waiting cache is in exactly one of three stages ([waiting_stages]):
+#
+#   stage 1   reqchan(C) ~= no_req                 request queued at the bus
+#   stage 2   bus_cmd ~= no_req & bus_owner = C    the bus is serving C
+#   stage 3   snpchan(C) = dat_*                   response in flight to C
+#
+# One `ranking` call, nine lexicographic components, no lemma and no temporal
+# operator anywhere in the proof:
+#
+#   [00]       stage 1: queued requests at least as old as _C's       (highest)
+#   [01],[02]  stage 3: _C installs the line it was sent
+#   [03]..[08] stage 2: the bus's snoop sweep                          (lowest)
+#
+# Why it has to be lexicographic rather than a flat set of stable schedulers
+# (Rule 8 / `l2s_auto5`): the snoop-sweep rankings [03]..[08] are *grown* by
+# `bus_arbitrate`, which starts a fresh transaction with every other cache
+# owing it a snoop.  That happens freely while _C is sitting in stage 1 or
+# stage 3.  Under Rule 10 it is legal, because `bus_arbitrate` needs an idle
+# bus, and an idle bus plus `waiting(_C)` means -- by [waiting_stages], whose
+# stage-2 disjunct requires a busy bus -- that _C is in stage 1 or stage 3,
+# where [00] or [01]/[02] is scheduled and preempts the sweep.  Spelled out:
+#
+#     ~pre([03]..[08])  /\  waiting(_C)   ==>   bus_cmd ~= no_req
+#
+# which is why every sweep ranking carries the conjunct `bus_cmd ~= no_req`.
+#
+# Two facts about the `ranking` tactic that shape what is written below
+# (see LIVENESS_CASE_STUDY_GERMAN.md §6.2, §6.3):
+#
+#   * only `l2s_needed_preserved` and `l2s_sched_stable` are discounted by
+#     preemption.  `l2s_progress` is not, so *every* component must reduce its
+#     own ranking whenever its own scheduler is on, preempted or not.  Since
+#     the `wf_*` flags pulse even when their rule is disabled, each scheduler
+#     below is literally the enabling guard of its rule.
+#   * component suffixes are sorted as strings, so they are written with two
+#     digits.
+# ---------------------------------------------------------------------------
+
+include order
+
+# Logical timestamps ordering the queued requests.
+instance ts : unbounded_sequence
+
+finite type cache
+type value
+
+type busreq   = { no_req, busrd, busrdx, busupgr }
+type snoopmsg = { no_snoop, snp_inv, snp_dgrade, dat_shared, dat_modified }
+type rspmsg   = { no_rsp, snp_ack }
+type cstate   = { invalid, shared, modified }
+
+object s = {
+    var reqchan(C:cache) : busreq
+    var snpchan(C:cache) : snoopmsg
+    var snpval(C:cache)  : value
+    var rspchan(C:cache) : rspmsg
+
+    var st(C:cache)  : cstate
+    var val(C:cache) : value
+
+    var bus_cmd   : busreq
+    var bus_owner : cache
+    var pending_snoop(C:cache) : bool
+    var to_snoop(C:cache) : bool
+
+    var mem_val : value
+    var dirty   : bool
+
+    var waiting(C:cache) : bool
+
+    # Timestamp of C's outstanding request; the arbiter serves the oldest.
+    var reqts(C:cache) : ts
+}
+
+var clock    : ts                       # next timestamp to hand out
+var owner    : cache
+var last_val : value
+
+# ---------------------------------------------------------------------------
+# Fairness instrumentation.
+#
+# Each bus-side rule gets a boolean flag pulsed (`:= true; := false;`) in a
+# single atomic step, *before* the rule's guard is tested, and the rule itself
+# becomes a guarded command.  A turn offered to a disabled rule is then a
+# stutter step, so `globally eventually wf_x` says only "the scheduler offers
+# rule x a turn infinitely often" -- a statement about the scheduler that is
+# always satisfiable.
+#
+# The tempting alternative -- pulse the flag and then `require` the guard --
+# is a vacuity trap: in an exported action `require` prunes the trace, so the
+# assumption silently becomes "rule x *successfully executes* infinitely
+# often", which is stronger than strong fairness and can be unsatisfiable.
+# See LIVENESS_CASE_STUDY_GERMAN.md §3.1.
+# ---------------------------------------------------------------------------
+
+var wf_arb   : bool                     # bus_arbitrate
+var wf_send(C:cache)  : bool            # send_snoop
+var wf_snoop(C:cache) : bool            # snoop_respond
+var wf_ack(C:cache)   : bool            # recv_ack
+var wf_cmpl  : bool                     # bus_complete
+var wf_rds(C:cache)   : bool            # recv_dat_shared
+var wf_rdm(C:cache)   : bool            # recv_dat_modified
+
+after init {
+    s.reqchan(C) := no_req;
+    s.snpchan(C) := no_snoop;
+    s.rspchan(C) := no_rsp;
+    s.st(C) := invalid;
+    s.bus_cmd := no_req;
+    s.pending_snoop(C) := false;
+    s.to_snoop(C) := false;
+    s.waiting(C) := false;
+    s.dirty := false;
+    s.mem_val := last_val;
+    s.val(C) := last_val;
+    s.snpval(C) := last_val;
+
+    wf_arb := false;
+    wf_send(C) := false;
+    wf_snoop(C) := false;
+    wf_ack(C) := false;
+    wf_cmpl := false;
+    wf_rds(C) := false;
+    wf_rdm(C) := false;
+
+    s.reqts(C) := 0;
+    clock := 0;
+    clock := clock.next;
+}
+
+# ---------------------------------------------------------------------------
+# Processor side: environment actions, no fairness flag (we never want to
+# force a processor to issue a request).
+# ---------------------------------------------------------------------------
+
+action pr_read(cl:cache) = {
+    require ~s.waiting(cl);
+    require s.st(cl) = invalid & s.reqchan(cl) = no_req;
+    s.reqchan(cl) := busrd;
+    s.reqts(cl) := clock;
+    clock := clock.next;
+    s.waiting(cl) := true;
+}
+
+action pr_write(cl:cache) = {
+    require ~s.waiting(cl);
+    require s.st(cl) ~= modified & s.reqchan(cl) = no_req;
+    if s.st(cl) = shared {
+        s.reqchan(cl) := busupgr;
+    } else {
+        s.reqchan(cl) := busrdx;
+    };
+    s.reqts(cl) := clock;
+    clock := clock.next;
+    s.waiting(cl) := true;
+}
+
+action pr_store(cl:cache, v:value) = {
+    require s.st(cl) = modified;
+    s.val(cl) := v;
+    last_val := v;
+}
+
+action evict_shared(cl:cache) = {
+    require ~s.waiting(cl) & s.st(cl) = shared;
+    s.st(cl) := invalid;
+}
+
+action evict_modified(cl:cache) = {
+    require ~s.waiting(cl) & s.st(cl) = modified;
+    s.mem_val := s.val(cl);
+    s.dirty := false;
+    s.st(cl) := invalid;
+}
+
+# ---------------------------------------------------------------------------
+# Bus side: the seven fair rules.
+# ---------------------------------------------------------------------------
+
+# FIFO arbitration: serve the oldest queued request.  This is the only change
+# to the protocol itself, and it is what replaces compassion.  Note that the
+# rule is unparameterized, which is exactly what makes its guard stable.
+action bus_arbitrate = {
+    wf_arb := true;
+    wf_arb := false;
+    if s.bus_cmd = no_req {
+        if some cl:cache. s.reqchan(cl) ~= no_req minimizing s.reqts(cl) {
+            s.bus_cmd := s.reqchan(cl);
+            s.reqchan(cl) := no_req;
+            s.bus_owner := cl;
+            s.pending_snoop(C) := C ~= cl;
+            s.to_snoop(C) := C ~= cl;
+        }
+    }
+}
+
+action send_snoop(cl:cache) = {
+    wf_send(cl) := true;
+    wf_send(cl) := false;
+    if s.bus_cmd ~= no_req & s.to_snoop(cl) & s.snpchan(cl) = no_snoop {
+        if s.bus_cmd = busrd {
+            s.snpchan(cl) := snp_dgrade;
+        } else {
+            s.snpchan(cl) := snp_inv;
+        };
+        s.to_snoop(cl) := false;
+    }
+}
+
+action snoop_respond(cl:cache) = {
+    wf_snoop(cl) := true;
+    wf_snoop(cl) := false;
+    if (s.snpchan(cl) = snp_inv | s.snpchan(cl) = snp_dgrade)
+       & s.rspchan(cl) = no_rsp {
+        if s.st(cl) = modified {
+            s.mem_val := s.val(cl);
+            s.dirty := false;
+        };
+        if s.snpchan(cl) = snp_inv {
+            s.st(cl) := invalid;
+            if s.reqchan(cl) = busupgr {
+                s.reqchan(cl) := busrdx;
+            }
+        } else {
+            if s.st(cl) = modified {
+                s.st(cl) := shared;
+            }
+        };
+        s.snpchan(cl) := no_snoop;
+        s.rspchan(cl) := snp_ack;
+    }
+}
+
+action recv_ack(cl:cache) = {
+    wf_ack(cl) := true;
+    wf_ack(cl) := false;
+    if s.bus_cmd ~= no_req & s.rspchan(cl) = snp_ack {
+        s.pending_snoop(cl) := false;
+        s.rspchan(cl) := no_rsp;
+    }
+}
+
+action bus_complete = {
+    wf_cmpl := true;
+    wf_cmpl := false;
+    if s.bus_cmd ~= no_req
+       & (forall I. ~s.pending_snoop(I))
+       & s.snpchan(s.bus_owner) = no_snoop {
+        s.snpval(s.bus_owner) := s.mem_val;
+        if s.bus_cmd = busrd {
+            s.snpchan(s.bus_owner) := dat_shared;
+        } else {
+            s.snpchan(s.bus_owner) := dat_modified;
+        };
+        s.bus_cmd := no_req;
+    }
+}
+
+action recv_dat_shared(cl:cache) = {
+    wf_rds(cl) := true;
+    wf_rds(cl) := false;
+    if s.snpchan(cl) = dat_shared {
+        s.st(cl) := shared;
+        s.val(cl) := s.snpval(cl);
+        s.snpchan(cl) := no_snoop;
+        s.waiting(cl) := false;
+    }
+}
+
+action recv_dat_modified(cl:cache) = {
+    wf_rdm(cl) := true;
+    wf_rdm(cl) := false;
+    if s.snpchan(cl) = dat_modified {
+        s.st(cl) := modified;
+        s.val(cl) := s.snpval(cl);
+        s.snpchan(cl) := no_snoop;
+        s.dirty := true;
+        owner := cl;
+        s.waiting(cl) := false;
+    }
+}
+
+export pr_read
+export pr_write
+export pr_store
+export evict_shared
+export evict_modified
+export bus_arbitrate
+export send_snoop
+export snoop_respond
+export recv_ack
+export bus_complete
+export recv_dat_shared
+export recv_dat_modified
+
+# ---------------------------------------------------------------------------
+# The fairness flags are only momentarily true.
+# ---------------------------------------------------------------------------
+
+invariant ~wf_arb
+invariant ~wf_send(C)
+invariant ~wf_snoop(C)
+invariant ~wf_ack(C)
+invariant ~wf_cmpl
+invariant ~wf_rds(C)
+invariant ~wf_rdm(C)
+
+# ---------------------------------------------------------------------------
+# Coherence (proved in msi.ivy; unchanged here).
+# ---------------------------------------------------------------------------
+
+invariant [swmr] s.st(C) = modified & C ~= D -> s.st(D) = invalid
+invariant [dvi]  s.st(C) ~= invalid -> s.val(C) = last_val
+
+invariant [mod_dirty]    s.st(C) = modified -> s.dirty & C = owner
+invariant [dirty_owner]  s.dirty -> s.st(owner) = modified
+invariant [shared_clean] s.st(C) = shared -> ~s.dirty
+invariant [mem_clean]    ~s.dirty -> s.mem_val = last_val
+
+invariant [pending_busy]    s.pending_snoop(C) -> s.bus_cmd ~= no_req
+invariant [tosnoop_pending] s.to_snoop(C) -> s.pending_snoop(C)
+invariant [ack_pending]     s.rspchan(C) = snp_ack -> s.pending_snoop(C) & ~s.to_snoop(C)
+invariant [ack_no_snp]      s.rspchan(C) = snp_ack -> s.snpchan(C) = no_snoop
+invariant [snp_pending]     (s.snpchan(C) = snp_inv | s.snpchan(C) = snp_dgrade)
+                            -> s.pending_snoop(C) & ~s.to_snoop(C)
+
+invariant [snp_is_dgrade]   s.bus_cmd = busrd -> s.snpchan(C) ~= snp_inv
+invariant [snp_is_inv]      (s.bus_cmd = busrdx | s.bus_cmd = busupgr)
+                            -> s.snpchan(C) ~= snp_dgrade
+
+invariant [owner_free]
+    s.bus_cmd ~= no_req -> ~s.pending_snoop(s.bus_owner) & s.snpchan(s.bus_owner) = no_snoop
+                           & s.rspchan(s.bus_owner) = no_rsp
+
+invariant [grant_pending]
+    s.bus_cmd ~= no_req & (s.snpchan(C) = dat_shared | s.snpchan(C) = dat_modified)
+    -> s.pending_snoop(C) & s.to_snoop(C)
+
+invariant [not_stuck]
+    s.pending_snoop(C) & ~s.to_snoop(C)
+    -> s.snpchan(C) = snp_inv | s.snpchan(C) = snp_dgrade | s.rspchan(C) = snp_ack
+
+invariant [one_grant]
+    (s.snpchan(C) = dat_shared | s.snpchan(C) = dat_modified)
+    & (s.snpchan(D) = dat_shared | s.snpchan(D) = dat_modified) -> C = D
+invariant [grant_val]
+    (s.snpchan(C) = dat_shared | s.snpchan(C) = dat_modified) -> s.snpval(C) = last_val
+invariant [grant_clean]
+    (s.snpchan(C) = dat_shared | s.snpchan(C) = dat_modified) -> ~s.dirty
+invariant [grant_mod_excl]
+    s.snpchan(C) = dat_modified & D ~= C -> s.st(D) = invalid
+
+invariant [inv_progress]
+    (s.bus_cmd = busrdx | s.bus_cmd = busupgr) & C ~= s.bus_owner
+    & (~s.pending_snoop(C) | s.rspchan(C) = snp_ack) -> s.st(C) = invalid
+
+invariant [mod_snooped]
+    s.bus_cmd ~= no_req & s.st(C) = modified
+    -> C ~= s.bus_owner & s.pending_snoop(C) & s.rspchan(C) ~= snp_ack
+
+invariant [req_not_mod]   s.reqchan(C) ~= no_req -> s.st(C) ~= modified
+invariant [upgr_shared]   s.reqchan(C) = busupgr -> s.st(C) = shared
+invariant [busrd_inv]     s.reqchan(C) = busrd -> s.st(C) = invalid
+invariant [owner_not_mod] s.bus_cmd ~= no_req -> s.st(s.bus_owner) ~= modified
+invariant [upgr_owner]    s.bus_cmd = busupgr -> s.st(s.bus_owner) = shared
+
+invariant [waiting_stages]
+    s.waiting(C) <-> (s.reqchan(C) ~= no_req
+                      | (s.bus_cmd ~= no_req & s.bus_owner = C)
+                      | s.snpchan(C) = dat_shared
+                      | s.snpchan(C) = dat_modified)
+
+invariant [stage1_excl]
+    s.reqchan(C) ~= no_req ->
+        ~(s.bus_cmd ~= no_req & s.bus_owner = C)
+        & s.snpchan(C) ~= dat_shared & s.snpchan(C) ~= dat_modified
+
+# Timestamps are handed out in increasing order, so a request issued later is
+# strictly younger than every request already in the machine.  This is what
+# makes ranking [00] shrink: a new request can never join it.
+invariant [ts_below_clock] s.reqts(C) < clock
+
+# ---------------------------------------------------------------------------
+# Fairness assumptions: weak fairness (justice) for every bus-side rule, and
+# nothing else.  No compassion anywhere.
+# ---------------------------------------------------------------------------
+
+explicit temporal axiom [wfa_arb]   globally eventually wf_arb
+explicit temporal axiom [wfa_cmpl]  globally eventually wf_cmpl
+explicit temporal axiom [wfa_send]  forall C. globally eventually wf_send(C)
+explicit temporal axiom [wfa_snoop] forall C. globally eventually wf_snoop(C)
+explicit temporal axiom [wfa_ack]   forall C. globally eventually wf_ack(C)
+explicit temporal axiom [wfa_rds]   forall C. globally eventually wf_rds(C)
+explicit temporal axiom [wfa_rdm]   forall C. globally eventually wf_rdm(C)
+
+# ---------------------------------------------------------------------------
+# LIVENESS: every processor request eventually receives a response.
+# ---------------------------------------------------------------------------
+
+explicit temporal property [live]
+  forall C. globally (s.waiting(C) -> eventually ~s.waiting(C))
+proof {
+  tactic skolemizenp;
+  instantiate wfa_arb;
+  instantiate wfa_cmpl;
+  instantiate wfa_send;
+  instantiate wfa_snoop;
+  instantiate wfa_ack;
+  instantiate wfa_rds;
+  instantiate wfa_rdm;
+  tactic ranking with {
+
+    # ===== stage 1: queued requests at least as old as _C's ===============
+    #
+    # The arbiter always picks the oldest queued request, so while _C is
+    # queued every pick removes an element of this set; and because
+    # timestamps only increase, a freshly issued request can never join it.
+    # This is the CAV'24 "pending timestamps <= mine" ranking, carried over
+    # caches rather than over timestamps so that `work_created = true` stays
+    # a legitimate finite bound and every component has the same sort.
+    definition work_created[00](N:cache) = true
+    definition work_needed[00](N:cache)  = s.reqchan(N) ~= no_req
+                                           & s.reqts(N) <= s.reqts(_C)
+    definition work_invar[00]            = s.waiting(_C)
+    definition work_progress[00](N:cache)= wf_arb
+    definition work_helpful[00](N:cache) = s.bus_cmd = no_req
+                                           & s.reqchan(_C) ~= no_req
+
+    # ===== stage 3: _C installs the line it was sent ======================
+    definition work_created[01](N:cache) = true
+    definition work_needed[01](N:cache)  = s.waiting(_C)
+    definition work_invar[01]            = s.waiting(_C)
+    definition work_progress[01](N:cache)= wf_rds(N)
+    definition work_helpful[01](N:cache) = N = _C & s.snpchan(_C) = dat_shared
+
+    definition work_created[02](N:cache) = true
+    definition work_needed[02](N:cache)  = s.waiting(_C)
+    definition work_invar[02]            = s.waiting(_C)
+    definition work_progress[02](N:cache)= wf_rdm(N)
+    definition work_helpful[02](N:cache) = N = _C & s.snpchan(_C) = dat_modified
+
+    # ===== stage 2: the bus's snoop sweep =================================
+    #
+    #   pending_snoop --send_snoop--> snoop in snpchan
+    #                 --snoop_respond--> ack in rspchan
+    #                 --recv_ack--> obligation retired
+    #
+    # Each component ranks on a superset of the stages still to come, so the
+    # rule that advances a cache through the sweep conserves every ranking
+    # above it.  All of them carry `bus_cmd ~= no_req`: that is what makes
+    # them empty the instant the bus goes idle, so `bus_arbitrate` -- the one
+    # rule that grows them -- can only fire from a state where stage 1 or
+    # stage 3 is scheduled and they are preempted anyway.
+
+    # [03] the bus retires one snoop obligation.
+    definition work_created[03](N:cache) = true
+    definition work_needed[03](N:cache)  = s.bus_cmd ~= no_req
+                                           & s.pending_snoop(N)
+    definition work_invar[03]            = s.waiting(_C)
+    definition work_progress[03](N:cache)= wf_ack(N)
+    definition work_helpful[03](N:cache) = s.bus_cmd ~= no_req
+                                           & s.rspchan(N) = snp_ack
+
+    # [04] a bystander applies its snoop and acks.
+    definition work_created[04](N:cache) = true
+    definition work_needed[04](N:cache)  = s.bus_cmd ~= no_req
+                                           & s.pending_snoop(N)
+                                           & s.rspchan(N) ~= snp_ack
+    definition work_invar[04]            = s.waiting(_C)
+    definition work_progress[04](N:cache)= wf_snoop(N)
+    definition work_helpful[04](N:cache) = (s.snpchan(N) = snp_inv
+                                            | s.snpchan(N) = snp_dgrade)
+                                           & s.rspchan(N) = no_rsp
+
+    # [05] the bus puts the snoop in the bystander's channel.
+    definition work_created[05](N:cache) = true
+    definition work_needed[05](N:cache)  = s.bus_cmd ~= no_req
+                                           & s.to_snoop(N)
+    definition work_invar[05]            = s.waiting(_C)
+    definition work_progress[05](N:cache)= wf_send(N)
+    definition work_helpful[05](N:cache) = s.bus_cmd ~= no_req
+                                           & s.to_snoop(N)
+                                           & s.snpchan(N) = no_snoop
+
+    # [06] a bystander drains a stale shared response, unblocking its snoop
+    #      channel.  This is a genuine sweep stage: an unconsumed response
+    #      occupies the very channel the next snoop has to travel down.
+    definition work_created[06](N:cache) = true
+    definition work_needed[06](N:cache)  = s.bus_cmd ~= no_req
+                                           & s.pending_snoop(N)
+                                           & s.snpchan(N) = dat_shared
+    definition work_invar[06]            = s.waiting(_C)
+    definition work_progress[06](N:cache)= wf_rds(N)
+    definition work_helpful[06](N:cache) = s.bus_cmd ~= no_req
+                                           & s.pending_snoop(N)
+                                           & s.snpchan(N) = dat_shared
+
+    # [07] likewise for a stale exclusive response.
+    definition work_created[07](N:cache) = true
+    definition work_needed[07](N:cache)  = s.bus_cmd ~= no_req
+                                           & s.pending_snoop(N)
+                                           & s.snpchan(N) = dat_modified
+    definition work_invar[07]            = s.waiting(_C)
+    definition work_progress[07](N:cache)= wf_rdm(N)
+    definition work_helpful[07](N:cache) = s.bus_cmd ~= no_req
+                                           & s.pending_snoop(N)
+                                           & s.snpchan(N) = dat_modified
+
+    # [08] every bystander has acked: answer the requester, release the bus.
+    definition work_created[08](N:cache) = true
+    definition work_needed[08](N:cache)  = s.bus_cmd ~= no_req
+    definition work_invar[08]            = s.waiting(_C)
+    definition work_progress[08](N:cache)= wf_cmpl
+    definition work_helpful[08](N:cache) = s.bus_cmd ~= no_req
+                                           & (forall I. ~s.pending_snoop(I))
+                                           & s.snpchan(s.bus_owner) = no_snoop
+  }
+}
+
+# ---------------------------------------------------------------------------
+# The same property in its literal phrasing: a request queued on the bus is
+# eventually answered.
+#
+# This is a corollary of [live], chained propositionally (Rule 7): by
+# [waiting_stages] a queued request implies `waiting`, and `eventually
+# ~waiting(_C)` then discharges the goal.  The ranking here is degenerate --
+# `work_needed = true` never shrinks -- and the obligation is met instead
+# because `work_invar` and `work_progress` are contradictory: the tableau bit
+# `eventually ~waiting(_C)` supplied by [live] cannot coexist with the goal
+# never happening.
+# ---------------------------------------------------------------------------
+
+explicit temporal property [request_answered]
+  forall C. globally (s.reqchan(C) ~= no_req -> eventually ~s.waiting(C))
+proof {
+  tactic skolemizenp;
+  instantiate live with C = _C;
+  tactic ranking with {
+    definition work_created = true
+    definition work_needed  = true
+    definition work_invar   = eventually ~s.waiting(_C)
+    definition work_progress= ~s.waiting(_C)
+    definition work_helpful = true
+  }
+}
