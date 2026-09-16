@@ -1,0 +1,283 @@
+#lang ivy1.8
+
+# ---------------------------------------------------------------------------
+# Lamport's distributed mutual exclusion (DME) algorithm -- liveness.
+#
+# Flat (monolithic) first-order transition system, derived from the protocol
+# encoding of `lamport_mutex_man.ivy`:
+#
+#   * three message kinds, request / reply / release
+#   * every node keeps a request queue `req(N,X)` -- the timestamp of the
+#     request it last heard from X, 0 if none
+#   * every node keeps `rep(N,X)` -- the highest reply timestamp heard from X
+#   * a node enters its critical section when its own request is
+#     lexicographically least in its queue and it has heard a *later* reply
+#     from every other node
+#   * channels are per-ordered-pair FIFO (this is the assumption
+#     `lamport_mutex_man.ivy` encodes with its `sent(S,D,M)` overlay and the
+#     comment "Because of in-order delivery, the timestamps are received in
+#     increasing order")
+#
+# The model is flattened out of the `process node(self)` / `isolate overlay`
+# form because the liveness-to-safety tactics need one monolithic transition
+# system.  `node(Y).request_ts(X)` becomes `req(Y,X)`, and `overlay.sent`
+# becomes `chan`.
+# ---------------------------------------------------------------------------
+
+include order
+
+# ---- host identifiers: a finite, totally ordered type -----------------------
+
+finite type node
+relation (X:node < Y:node)
+axiom [node_trans] (X:node < Y & Y < Z) -> X < Z
+axiom [node_asym]  ~(X:node < Y & Y < X)
+axiom [node_total] X:node < Y | X = Y | Y < X
+
+# ---- logical timestamps -----------------------------------------------------
+
+instance ts : unbounded_sequence
+
+# ---- messages ---------------------------------------------------------------
+
+type msg_kind = {request, reply, release}
+
+# ---- per-node control state -------------------------------------------------
+
+type mode = {idle, waiting, critical}
+
+var st(N:node) : mode            # idle / waiting / critical
+var clock(N:node) : ts           # the node's Lamport clock
+var req(N:node, X:node) : ts     # N's request queue: X's request, 0 = none
+var rep(N:node, X:node) : ts     # highest reply timestamp N heard from X
+
+# ---- the network ------------------------------------------------------------
+#
+# chan(S,D,K,T) : a message of kind K carrying timestamp T is in flight from
+# S to D.  Delivery is in increasing timestamp order per ordered pair, which
+# (because a node stamps every message it sends with a fresh, strictly larger
+# timestamp) is exactly FIFO.
+
+relation chan(S:node, D:node, K:msg_kind, T:ts)
+
+# rcvd(D,S) : ghost.  The highest timestamp D has taken off the channel from
+# S.  Only used to state the FIFO invariant.
+var rcvd(N:node, X:node) : ts
+
+# last_ts / last_node : ghost.  The timestamp minted by the last step, and the
+# node that minted it.  `last_ts` is a *nullary* symbol, so the liveness
+# monitor adds its value to the abstraction domain `l2s_d` at the end of every
+# step; that is what makes "every in-flight timestamp has been produced" an
+# inductive invariant, i.e. Rule 5 finiteness for the timestamp sort.
+# `last_node` exists only so that the invariant `clock(last_node) = last_ts`
+# can tie `last_ts` to the real state -- without a reader, Ivy slices the
+# ghost away and the abstraction domain never sees the new timestamps.
+var last_ts : ts
+var last_node : node
+
+# ---- lexicographic order on (timestamp, node) -------------------------------
+
+function lexord(T1:ts, N1:node, T2:ts, N2:node) =
+    T1 < T2 | (T1 = T2 & N1 < N2)
+
+# ---- fairness flags ---------------------------------------------------------
+#
+# Every fair rule is a *guarded command* whose flag is pulsed before the
+# guard, so that a turn offered to a disabled rule is a stutter step and
+# `globally eventually wf_x` is an honest statement about the scheduler
+# (LIVENESS_CASE_STUDY_GERMAN.md section 3).
+
+relation wf_recv(S:node, D:node)
+relation wf_check(N:node)
+relation wf_exit(N:node)
+
+after init {
+    st(N) := idle;
+    clock(N) := 0;
+    req(N,X) := 0;
+    rep(N,X) := 0;
+    rcvd(N,X) := 0;
+    chan(S,D,K,T) := false;
+    last_ts := 0;
+    last_node := 0;
+    wf_recv(S,D) := false;
+    wf_check(N) := false;
+    wf_exit(N) := false;
+}
+
+# ---------------------------------------------------------------------------
+# request_cs(n) -- the client of node n asks to enter the critical section.
+#
+# This is an *environment* action: it carries no fairness flag, because we
+# never want to assume that requests are issued.
+# ---------------------------------------------------------------------------
+
+action request_cs(n:node) = {
+    if st(n) = idle {
+        var t := clock(n).next;
+        clock(n) := t;
+        last_ts := t;
+        last_node := n;
+        req(n,n) := t;
+        chan(n,D,request,t) := (D ~= n) | chan(n,D,request,t);
+        st(n) := waiting;
+    }
+}
+
+# ---------------------------------------------------------------------------
+# recv(s,d) -- the network delivers the head (least timestamp) of the channel
+# from s to d.
+# ---------------------------------------------------------------------------
+
+action recv(s:node, d:node) = {
+    wf_recv(s,d) := true;
+    wf_recv(s,d) := false;
+    if some t:ts. (exists K. chan(s,d,K,t)) minimizing t {
+        var isreq := chan(s,d,request,t);
+        var isrel := chan(s,d,release,t);
+        var isrep := chan(s,d,reply,t);
+        chan(s,d,K,t) := false;
+        rcvd(d,s) := t;
+        var nt := ts.max2(t,clock(d)).next;
+        clock(d) := nt;
+        last_ts := nt;
+        last_node := d;
+        if isreq {
+            req(d,s) := t;
+            chan(d,s,reply,nt) := true;
+        } else if isrel {
+            req(d,s) := 0;
+        } else if isrep {
+            rep(d,s) := t;
+        }
+    }
+}
+
+# ---------------------------------------------------------------------------
+# check_cs(n) -- n tests the entry condition and enters if it holds.
+# ---------------------------------------------------------------------------
+
+action check_cs(n:node) = {
+    wf_check(n) := true;
+    wf_check(n) := false;
+    if st(n) = waiting
+       & (forall X. X = n | req(n,X) = 0 | lexord(req(n,n),n,req(n,X),X))
+       & (forall X. X = n | rep(n,X) > req(n,n))
+    {
+        st(n) := critical;
+    }
+}
+
+# ---------------------------------------------------------------------------
+# exit_cs(n) -- n leaves the critical section and broadcasts a release.
+# ---------------------------------------------------------------------------
+
+action exit_cs(n:node) = {
+    wf_exit(n) := true;
+    wf_exit(n) := false;
+    if st(n) = critical {
+        var t := clock(n).next;
+        clock(n) := t;
+        last_ts := t;
+        last_node := n;
+        req(n,n) := 0;
+        chan(n,D,release,t) := (D ~= n) | chan(n,D,release,t);
+        st(n) := idle;
+    }
+}
+
+export request_cs
+export recv
+export check_cs
+export exit_cs
+
+# ---------------------------------------------------------------------------
+# Safety invariants (ported from lamport_mutex_man.ivy).
+# ---------------------------------------------------------------------------
+
+invariant [fair_flags_low1] ~wf_recv(S,D)
+invariant [fair_flags_low2] ~wf_check(N)
+invariant [fair_flags_low3] ~wf_exit(N)
+
+invariant [no_self_msg] ~chan(S,S,K,T)
+
+invariant [msg_below_clock] chan(S,D,K,T) -> T <= clock(S)
+invariant [req_below_clock] req(D,S) <= clock(S)
+invariant [rep_below_clock] rep(D,S) <= clock(S)
+invariant [rcvd_below_clock] rcvd(D,S) <= clock(S)
+invariant [last_mint] clock(last_node) = last_ts
+
+invariant [pending_iff] st(S) ~= idle <-> req(S,S) ~= 0
+
+invariant [no_regress_req] chan(S,D,K,T) -> req(D,S) <= T
+invariant [no_regress_rep] chan(S,D,K,T) -> rep(D,S) <= T
+invariant [fifo]           chan(S,D,K,T) -> rcvd(D,S) < T
+
+invariant [rel_before_req] chan(S,D,release,T) & st(S) ~= idle -> T < req(S,S)
+invariant [req_le_own]     chan(S,D,request,T) & st(S) ~= idle -> T <= req(S,S)
+
+invariant [request_known]
+    st(S) ~= idle & D ~= S ->
+        (chan(S,D,request,req(S,S)) | req(D,S) = req(S,S))
+
+invariant [crit_heard]  st(S) = critical & D ~= S -> req(S,S) < rep(S,D)
+invariant [crit_least]
+    st(S) = critical & D ~= S ->
+        (req(S,D) = 0 | lexord(req(S,S),S,req(S,D),D))
+
+invariant [mutex] st(X) = critical & st(Y) = critical -> X = Y
+
+# ---------------------------------------------------------------------------
+# Fairness assumptions.
+#
+# All three are *weak* fairness (justice): the scheduler offers every rule a
+# turn infinitely often.  Each flag is pulsed unconditionally, before the
+# rule's guard, so a turn offered to a disabled rule is a stutter step and the
+# assumption is an honest statement about the scheduler rather than a
+# disguised assumption that the rule fires.
+#
+#   wfa_recv  : every channel is serviced infinitely often
+#   wfa_check : every node tests its entry condition infinitely often
+#   wfa_exit  : every node is offered the chance to leave its critical section
+#
+# No strong fairness (compassion) is needed anywhere: the arbiter of Lamport's
+# algorithm is the (timestamp, id) order itself, which is FIFO, so -- unlike
+# the German protocol -- weak fairness suffices.
+# ---------------------------------------------------------------------------
+
+explicit temporal axiom [wfa_recv]  forall S,D. globally eventually wf_recv(S,D)
+explicit temporal axiom [wfa_check] forall N. globally eventually wf_check(N)
+explicit temporal axiom [wfa_exit]  forall N. globally eventually wf_exit(N)
+
+# ---------------------------------------------------------------------------
+# Lemma [delivery] : every message in flight is eventually delivered.
+#
+# This is the CAV'24 timestamped-queue ranking.  The ranking is the set of
+# timestamps still in the channel from _S to _D that are no larger than the
+# tracked message's own timestamp _T:
+#
+#     delta(T1)  =  (exists K. chan(_S,_D,K,T1)) & T1 <= _T
+#
+# It is conserved because _S stamps every new message with a value strictly
+# greater than its clock, which already dominates _T (invariant
+# msg_below_clock); and every turn given to recv(_S,_D) removes the *least*
+# timestamp in the channel, which is <= _T whenever the ranking is non-empty.
+#
+# Finiteness (Rule 5) comes from the ghost `last_ts`: it is a nullary symbol,
+# so the monitor adds its value to the abstraction domain at the end of every
+# step, which makes "every in-flight timestamp has been produced" inductive.
+# ---------------------------------------------------------------------------
+
+explicit temporal property [delivery]
+  forall S,D,K,T. globally (chan(S,D,K,T) -> eventually ~chan(S,D,K,T))
+proof {
+  tactic skolemizenp;
+  instantiate wfa_recv with S = _S, D = _D;
+  tactic ranking with {
+    definition work_created(T1:ts) = (exists K. chan(_S,_D,K,T1)) & T1 <= _T
+    definition work_needed(T1:ts)  = (exists K. chan(_S,_D,K,T1)) & T1 <= _T
+    definition work_invar          = chan(_S,_D,_K,_T)
+    definition work_progress       = wf_recv(_S,_D)
+    definition work_helpful        = exists K,T1. chan(_S,_D,K,T1) & T1 <= _T
+  }
+}

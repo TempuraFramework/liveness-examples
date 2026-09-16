@@ -1,0 +1,830 @@
+#lang ivy1.7
+
+# ############################################################################
+#
+#   TOMASULO'S ALGORITHM -- a documented Ivy model and its safety proof
+#
+#   This file is a heavily annotated rewrite of `tomasulo.ivy`, which is an
+#   Ivy encoding of the out-of-order execution engine of a CPU (Tomasulo's
+#   algorithm, IBM 360/91, 1967).  `tomasulo.ivy` carries
+#
+#       attribute method = vmt
+#
+#   which means that `ivy_check` does not verify it at all: it *transliterates*
+#   it into `tomasulo.vmt` for an external model checker.  That is not an
+#   accident -- as shipped, the model is outside Ivy's decidable fragment and
+#   its invariants are all commented out (the two that are left enabled fail).
+#   See section 3 below: the fix is a handful of "obscure" encoding moves whose
+#   only purpose is to keep the verification conditions in EPR.  With those
+#   moves the whole refinement proof is discharged by `ivy_check` in under a
+#   second, with no auxiliary lemmas and no interaction:
+#
+#       $ ~/workplace/venv_ivy/bin/ivy_check tomasulo_documented.ivy
+#       ...
+#       OK
+#
+#   Companion file: `tomasulo_liveness.ivy` states and proves a *liveness*
+#   property of the same machine ("no instruction starves in a reservation
+#   station") using McMillan's relational-ranking rules; see LIVENESS_GUIDE.md.
+#
+# ############################################################################
+#
+#   1.  WHAT TOMASULO'S ALGORITHM IS
+#   ================================
+#
+#   A simple CPU executes instructions strictly in order: fetch, read the
+#   register operands, compute, write the destination register, repeat.  That
+#   is slow, because an instruction whose operand is not ready yet blocks every
+#   instruction behind it, even the ones that could have run immediately.
+#
+#   Tomasulo's algorithm lets instructions execute *out of order* while
+#   preserving the results of the in-order machine.  It has four ingredients:
+#
+#   (a) RESERVATION STATIONS.  Instead of waiting in a queue, a decoded
+#       instruction is parked in a buffer entry called a reservation station
+#       (RS).  Each station holds the opcode, the two operand slots, and a
+#       destination.  An operand slot is in one of two states:
+#
+#           valid            -- it already holds the operand *value*
+#           not valid        -- it holds the *tag* of the station that is
+#                               going to produce the value
+#
+#   (b) REGISTER RENAMING VIA TAGS.  Every reservation station has a unique
+#       name, its "tag".  When an instruction is placed in station t with
+#       destination register r, the machine marks r as *reserved with tag t*.
+#       From then on, any later instruction that reads r does not read a value
+#       -- it copies the tag t into its operand slot and waits.  The tag is
+#       therefore a *forward reference* to a value that does not exist yet.
+#       This is what removes write-after-read and write-after-write hazards:
+#       the architectural register r no longer has one meaning, it has one
+#       meaning per in-flight writer, and the tag distinguishes them.
+#
+#   (c) THE COMMON DATA BUS (CDB).  When an execution unit finishes, it puts
+#       the pair (tag, value) on a single broadcast bus.  Every register and
+#       every operand slot that is waiting for that tag latches the value in
+#       the same cycle ("snooping").  This is the *wake-up* mechanism, and it
+#       is the only way a not-valid operand slot ever becomes valid.  Exactly
+#       one result per cycle can be broadcast, so the CDB is the machine's
+#       central arbitrated resource.
+#
+#   (d) EXECUTION UNITS.  A station whose two operands are both valid may be
+#       *issued* to any free execution unit (EU), which computes the result
+#       after an unpredictable number of cycles and then asks for the CDB.
+#       Because issue only depends on operand readiness, instructions leave
+#       the stations in dataflow order, not program order.
+#
+#   The life of one ALU instruction, in this model, is therefore:
+#
+#       fetch/dispatch      -> station t becomes valid, operands captured
+#                              (as values, or as tags of earlier stations)
+#       wake-up (0..n times)-> CDB broadcasts the tags t is waiting for
+#       issue               -> t.issued := true, some EU takes the operands
+#       execute             -> the EU becomes "ready" (result computed)
+#       complete/writeback  -> the EU wins the CDB; the value is broadcast;
+#                              station t is freed; registers and stations
+#                              waiting on tag t latch the value
+#
+# ############################################################################
+#
+#   2.  WHAT IS BEING PROVED (THE CORRECTNESS STATEMENT)
+#   ====================================================
+#
+#   Tomasulo is not interesting because it satisfies some ad-hoc invariant; it
+#   is interesting because it is *equivalent to the in-order machine*.  So the
+#   property proved here is a REFINEMENT:
+#
+#       the out-of-order machine `toma` implements the in-order machine `ref`.
+#
+#   `ref` is a three-line specification CPU with a register file `ref.r` that
+#   executes each accepted instruction atomically and in order (object `ref`,
+#   below).  The two machines are run in lockstep: every non-stalling step of
+#   `toma` also steps `ref` (the call `ref.step(...)` at the end of
+#   `toma.step`; `ref` is ghost -- it exists only in the proof).
+#
+#   The refinement is stated by two facts, both invariants below:
+#
+#       [inv_reg_ready]     ~ir(R).resvd -> ir(R).val = ref.r(R)
+#
+#           an architectural register that is not reserved holds exactly the
+#           value the in-order machine has in it.
+#
+#       [inv_reg_reserved]  ir(R).resvd & ir(R).tag(K) -> st(K).valid
+#                                & aux(K).res = ref.r(R) & st(K).dst = R
+#
+#           a reserved register is owned by a live station K, and the value
+#           that K will eventually broadcast is *already* the value the
+#           in-order machine has in R.  In other words the renaming is a
+#           faithful promise.
+#
+#   Together they give the observable statement, which is asserted directly in
+#   the code as [refines_read]:
+#
+#           a register read that does not stall returns the in-order value.
+#
+#   THE GHOST ("aux") STATE.  The proof needs to talk about "the value station
+#   K will produce" before K has produced it.  That is what the `aux` array
+#   is: a ghost record per tag, written by `ref.step` at dispatch time, that
+#   records the operand values and the result the *in-order* machine computed
+#   for the instruction now sitting in station K.  The invariants then say
+#   that whatever the hardware eventually computes for K agrees with `aux(K)`.
+#   `aux` is a classic history/prophecy variable: it makes a statement about
+#   the future ("K will produce this value") checkable one step at a time.
+#
+# ############################################################################
+#
+#   3.  THE "OBSCURE" PART: KEEPING THE VERIFICATION CONDITIONS IN EPR
+#   ==================================================================
+#
+#   Ivy only promises decidable, counterexample-producing verification when
+#   the verification conditions land in EPR (effectively propositional logic:
+#   prenex forall*-exists* over an uninterpreted signature, with an acyclic
+#   quantifier-alternation/function graph).  The relevant rule of thumb is:
+#
+#       a FUNCTION whose result sort can be fed back into its own argument
+#       position, under a universal quantifier, creates a cycle and can
+#       generate an infinite sequence of instantiations.
+#
+#   `tomasulo.ivy` has two such functions, and both show up in the invariants
+#   that the refinement needs:
+#
+#     (i)  the operand tag,  st(K).opra.tag : tag_t -> tag_t.
+#          The invariant that makes the proof work is
+#
+#              st(K).valid & ~st(K).opra.valid & st(K).opra.tag = T
+#                  -> st(T).valid & aux(T).res = aux(K).opra
+#
+#          ("if K is waiting for T, then T is live and will produce exactly
+#          the operand K is waiting for").  With K universally quantified, the
+#          term `st(K).opra.tag` is itself a tag and can be substituted for K,
+#          giving opra.tag(opra.tag(opra.tag(...))) forever.  Running
+#          `ivy_check` on `tomasulo.ivy` with these invariants enabled prints
+#
+#              error: The verification condition is not in the fragment FAU.
+#              The following terms may generate an infinite sequence of
+#              instantiations:  toma.st.oprb.tag(K_d) = T_b
+#
+#     (ii) the ALU,  f : word_t * word_t -> word_t, likewise cyclic in word_t
+#          (f(f(x,y),z) ...).
+#
+#   THE FIX, in both cases, is to replace the function by a RELATION:
+#
+#          var      tag : tag_t                ~~>  relation tag(T:tag_t)
+#          function f(X,Y) : word_t            ~~>  relation f(X,Y,Z)
+#                                                   + a functionality axiom
+#
+#   A relation applied to universally quantified variables produces no new
+#   terms, so the cycle disappears and every VC is a decidable EPR query.  The
+#   price is that we must now *say* what the function symbol used to say for
+#   free: the ALU gets `axiom f(X,Y,Z1) & f(X,Y,Z2) -> Z1 = Z2`, and the
+#   reference machine computes a result by `res := *; assume f(opra,oprb,res)`
+#   instead of `res := f(opra,oprb)`.  Note that we do NOT state totality
+#   (`exists Z. f(X,Y,Z)`): that is a forall-exists formula and would
+#   reintroduce a Skolem function word_t*word_t -> word_t, i.e. the very cycle
+#   we removed.  Totality is instead a meta-level assumption; it costs nothing
+#   in soundness (an `assume` can only remove behaviours) but it does mean the
+#   model should be checked for vacuity separately -- see section 8.
+#
+#   Nothing else about the tag relations is constrained.  In particular we do
+#   not axiomatise "every station has exactly one operand tag".  We do not
+#   need to: the code only ever assigns tag relations from other tag relations
+#   or from a singleton (`ir(dst).tag(X) := st_choice = X`), and the
+#   invariants below only ever read them in the *positive* position
+#   `... .tag(T) -> ...`, which is exactly the EPR-friendly shape.
+#
+#   A third, smaller encoding move: `pout.tag`.  `pout` is a single record
+#   (the CDB), not an array, so `pout.tag : tag_t` is a CONSTANT, not a
+#   function of tag_t -- constants create no cycle.  So the bus tag stays a
+#   plain variable and is *related* to the EU tag relation by an `assume`
+#   (line marked [cdb_tag]).
+#
+# ############################################################################
+#
+#   4.  READING THE MODEL
+#   =====================
+#
+#   The whole machine is ONE atomic action, `toma.step`, which models one
+#   hardware clock cycle of a synchronous design.  Everything that a real
+#   pipeline does in parallel in a cycle happens inside that action, in the
+#   order in which the combinational logic settles:
+#
+#       phase 1   CDB arbitration + completion       (reads eu, writes pout)
+#       phase 2   stall computation                  (reads st, ir)
+#       phase 3   writeback/wake-up from the CDB     (writes ir, st)
+#       phase 4   dispatch of the incoming op        (writes st, ir)
+#       phase 5   issue station -> execution unit    (writes st, eu)
+#       phase 6   start execution                    (writes eu)
+#       phase 7   ghost: step the reference machine
+#
+#   The *inputs* of the cycle are the parameters of `toma.step`.  They are
+#   universally quantified by `export`, i.e. chosen adversarially each cycle:
+#
+#       opin, srca, srcb, dst, din   the instruction arriving from decode
+#       st_choice                    which station the dispatcher allocates
+#       issue_choice                 which station the issue arbiter picks
+#       issue_eu                     which execution unit it is issued to
+#       complete_eu                  which execution unit wins the CDB
+#
+#   Modelling an arbiter as an adversarial input is the standard trick for
+#   *safety*: it proves correctness for every possible arbitration policy.  It
+#   is also exactly what makes the model useless for *liveness* -- an
+#   adversarial arbiter starves everything -- which is why the companion
+#   liveness file has to add fairness assumptions on these choices.
+#
+#   One more input is hidden: `eu(E).ready` is declared but never assigned.
+#   In Ivy an unassigned state variable is an oracle whose value is fixed at
+#   initialisation, so here it models "this EU's result is available".  Safety
+#   holds for every choice of `ready`; for liveness it must become dynamic
+#   (an EU that is busy must eventually become ready), and that is one of the
+#   changes made in `tomasulo_liveness.ivy`.
+#
+# ############################################################################
+
+
+# ----------------------------------------------------------------------------
+# 4.1  Sorts
+# ----------------------------------------------------------------------------
+#
+# All four sorts are uninterpreted: the proof holds for any word width, any
+# number of architectural registers, any number of reservation stations, and
+# any number of execution units.  This parameterisation is free in first-order
+# logic and is the main reason to verify hardware this way rather than by
+# model checking a fixed-size instance.
+
+type word_t                        # machine words (ALU operands and results)
+type reg_t                         # architectural register names
+type tag_t                         # reservation-station names == renaming tags
+type eu_t                          # execution units
+
+# The instruction set.  op_alu is the only interesting one: it is the only
+# opcode that allocates a station, reserves a register, and needs renaming.
+#   op_rd  reads a register out of the machine (the only observable output)
+#   op_wr  writes an immediate into a register
+#   op_nop does nothing (lets the environment idle a cycle)
+type opcode = {op_alu,op_rd,op_wr,op_nop}
+
+
+# ----------------------------------------------------------------------------
+# 4.2  An operand slot of a reservation station
+# ----------------------------------------------------------------------------
+#
+# `valid` distinguishes the two states of section 1(a).  When valid, `val` is
+# the operand value and `tag` is meaningless; when not valid, `tag` names the
+# station that will produce the value and `val` is meaningless.
+#
+# `tag` is a RELATION, not a `var tag : tag_t` -- this is encoding move (i) of
+# section 3.  Read `tag(T)` as "this slot is (also) waiting for T"; in every
+# reachable state the code keeps it a singleton, but we never have to say so.
+
+module st_opr_r = {
+    var valid : bool
+    relation tag(T:tag_t)
+    var val : word_t
+}
+
+# The CDB record.  `pout` is a single instance, so its `tag` may stay a
+# scalar: a constant symbol is not a function and creates no EPR cycle.
+module st_opr = {
+    var valid : bool
+    var tag : tag_t
+    var val : word_t
+}
+
+
+# ----------------------------------------------------------------------------
+# 4.3  The ALU
+# ----------------------------------------------------------------------------
+#
+# An uninterpreted binary operation over words: the proof is independent of
+# what the ALU actually computes, it only needs the two machines to compute
+# *the same* thing.  Encoded as a relation + functionality axiom, per section
+# 3 (ii).
+
+relation f(X:word_t,Y:word_t,Z:word_t)
+axiom [alu_is_a_function] f(X,Y,Z1) & f(X,Y,Z2) -> Z1 = Z2
+
+
+# ############################################################################
+#  5.  THE REFERENCE MACHINE (specification, ghost)
+# ############################################################################
+#
+# `ref` is the in-order CPU that `toma` must implement.  It has nothing but a
+# register file, and each step reads its operands, computes, and writes back,
+# atomically.  This is the definition of "what the program means".
+#
+# `ref.step` also writes the ghost `aux` array; that assignment logically
+# belongs to `toma` (hence the comment kept from the original file), but it is
+# convenient to put it here because this is the only place where the in-order
+# operand and result values exist as program variables.
+
+object ref = {
+
+    action step(opin : opcode,
+                srca:reg_t, srcb:reg_t, dst:reg_t,
+                din: word_t,
+                st_choice : tag_t,            # only used to index the ghost aux
+                issue_choice : tag_t)
+    returns (dout : word_t)
+
+    var r(R:reg_t) : word_t                   # the architectural register file
+
+    implement step {
+        var opra : word_t;
+        var oprb : word_t;
+        var res : word_t;
+
+        if opin = op_alu {
+            opra := r(srca);
+            oprb := r(srcb);
+            res := *;                         # see section 3 (ii): the ALU is
+            assume f(opra,oprb,res);          # a relation, so pick + constrain
+            r(dst) := res;
+        }
+        else if opin = op_rd {
+            dout := r(srca);
+        }
+        else if opin = op_wr {
+            r(dst) := din;
+        };
+
+        # ---- ghost bookkeeping ------------------------------------------
+        # Record, for the station that is being allocated in this very cycle,
+        # the in-order operand values and the in-order result.  Everything the
+        # out-of-order machine does with tag `st_choice` from now on is
+        # checked against this record.
+        if(opin = op_alu){
+            toma.aux(st_choice).opra := opra;
+            toma.aux(st_choice).oprb := oprb;
+            toma.aux(st_choice).res  := res;
+            toma.aux(st_choice).srca := srca;
+            toma.aux(st_choice).srcb := srcb;
+        };
+    }
+}
+
+
+# ############################################################################
+#  6.  THE OUT-OF-ORDER MACHINE
+# ############################################################################
+
+object toma = {
+
+    # ------------------------------------------------------------------
+    # 6.1  Architectural register file, with renaming information.
+    #
+    #   resvd   -- "the architectural value of this register is not here;
+    #              an in-flight instruction owns it"
+    #   tag     -- which station owns it (relation; see section 3)
+    #   val     -- the value, meaningful only when ~resvd
+    # ------------------------------------------------------------------
+    object ir(self:reg_t) = {
+        var resvd : bool
+        relation tag(T:tag_t)
+        var val : word_t
+    }
+
+    # ------------------------------------------------------------------
+    # 6.2  The reservation stations, indexed by tag.
+    #
+    #   valid   -- this station holds an instruction that has not retired
+    #   opra    -- operand slot A (value or tag)
+    #   oprb    -- operand slot B
+    #   dst     -- destination register.  Ghost: the RTL does not need it,
+    #              but the proof does (invariant [inv_reg_reserved]).
+    #   issued  -- this station's operands have been handed to an EU.  A
+    #              station is freed only when a result with its own tag comes
+    #              back on the CDB, and only if it was issued -- `issued` is
+    #              what prevents a station from being freed by a *stale*
+    #              broadcast of a previous tenant of the same tag.
+    # ------------------------------------------------------------------
+    object st(self:tag_t) = {
+        var valid : bool
+        instance opra : st_opr_r
+        instance oprb : st_opr_r
+        var dst : reg_t
+        var issued : bool
+    }
+
+    # ------------------------------------------------------------------
+    # 6.3  Execution units.
+    #
+    #   valid   -- occupied by an operation
+    #   ready   -- its result has been computed (an oracle here: see 4)
+    #   res     -- the result
+    #   tag     -- whose result it is (relation)
+    # ------------------------------------------------------------------
+    object eu(self:eu_t) = {
+        var valid : bool
+        var ready : bool
+        var res : word_t
+        relation tag(T:tag_t)
+    }
+
+    # ------------------------------------------------------------------
+    # 6.4  The ghost record, one per tag.  Written by ref.step at dispatch.
+    #
+    #   opra,oprb,res  what the in-order machine read and computed for the
+    #                  instruction now in this station
+    #   srca,srcb      its source registers (kept for readability; not used
+    #                  by the invariants below)
+    #   eu             which execution unit the station was issued to
+    # ------------------------------------------------------------------
+    object aux(self:tag_t) = {
+        var opra : word_t
+        var oprb : word_t
+        var res : word_t
+        var srca : reg_t
+        var srcb : reg_t
+        var eu : eu_t
+    }
+
+    # The common data bus.
+    instance pout : st_opr
+
+    after init {
+        st(T).valid := false;              # no instruction in flight
+        ir(R).resvd := false;              # no register renamed
+        eu(E).valid := false;              # no execution unit busy
+
+        # The EU tag relations are unconstrained at init, and `complete_eu`'s
+        # tag relation is read through an `assume` in phase 1.  If it happened
+        # to be empty, that `assume` would be unsatisfiable and *every* step
+        # would be blocked -- the model would be vacuously correct.  Starting
+        # it full costs nothing (no invariant mentions eu.tag while ~eu.valid)
+        # and removes the hole.
+        eu(E).tag(T) := true;
+
+        # The two machines start in the same state.  (ir(R).val is arbitrary;
+        # we simply define ref's register file to agree with it.)
+        ref.r(R) := ir(R).val;
+    }
+
+
+    # ====================================================================
+    # 6.5  ONE CLOCK CYCLE
+    # ====================================================================
+    action step (
+      opin : opcode,
+      srca:reg_t, srcb:reg_t, dst:reg_t,
+      din: word_t,
+      st_choice : tag_t,                   # dispatcher's choice of station
+      issue_choice : tag_t,                # issue arbiter's choice of station
+      issue_eu : eu_t,                     # issue arbiter's choice of EU
+      complete_eu : eu_t                   # CDB arbiter's choice of EU
+    )
+    returns (
+      stallout : bool,
+      dout : word_t
+    )
+    = {
+        var exe_rdy : bool;
+        var exe_valid : bool;
+        var exe_tag : tag_t;
+        var exe_opra : word_t;
+        var exe_oprb : word_t;
+
+        # ----------------------------------------------------------------
+        # PHASE 1 -- CDB arbitration and completion.
+        #
+        # The arbiter offers the bus to `complete_eu`.  The bus carries a
+        # result iff that unit is occupied and has finished.  The unit is
+        # released in the same cycle.
+        # ----------------------------------------------------------------
+        pout.valid := eu(complete_eu).valid & eu(complete_eu).ready;
+        pout.val := eu(complete_eu).res;
+        pout.tag := *;                                      # [cdb_tag]
+        assume eu(complete_eu).tag(pout.tag);               # (section 3, end)
+        if pout.valid {
+            eu(complete_eu).valid := false
+        };
+
+        # ----------------------------------------------------------------
+        # PHASE 2 -- structural and data hazards on the incoming instruction.
+        #
+        #   an ALU op stalls if the station the dispatcher picked is busy
+        #     (structural hazard -- the only backpressure in the machine);
+        #   a read stalls if the register it reads is renamed
+        #     (a read is the machine's observable output, so it must not be
+        #      answered with a stale value; this is precisely the condition
+        #      under which [inv_reg_ready] licenses the answer).
+        # A write never stalls: it *overwrites* the renaming, which is legal
+        # because from the in-order machine's point of view it is the newest
+        # writer of that register.
+        # ----------------------------------------------------------------
+        stallout := opin = op_alu & st(st_choice).valid
+                    | opin = op_rd & ir(srca).resvd;
+
+        # ----------------------------------------------------------------
+        # PHASE 3 -- writeback / wake-up.
+        #
+        # Everything snoops the bus in the same cycle:
+        #   * a register reserved with the broadcast tag latches the value
+        #     and stops being reserved (the renaming is redeemed);
+        #   * every operand slot waiting for the broadcast tag latches the
+        #     value and becomes valid;
+        #   * the producing station itself is freed (`issued` guards against
+        #     freeing a station that merely reuses the tag, see 6.2).
+        # Note these are simultaneous assignments over ALL registers R and ALL
+        # tags T -- one line of Ivy for a whole comparator array in the RTL.
+        # ----------------------------------------------------------------
+        if(pout.valid){
+            ir(R).val := (pout.val) if (ir(R).resvd & ir(R).tag(pout.tag)) else (ir(R).val);
+            ir(R).resvd := ~ir(R).tag(pout.tag) & ir(R).resvd;
+
+            st(T).opra.val := (pout.val) if ~st(T).opra.valid & st(T).opra.tag(pout.tag) else st(T).opra.val;
+            st(T).opra.valid := st(T).opra.tag(pout.tag) | st(T).opra.valid;
+
+            st(T).oprb.val := (pout.val) if ~st(T).oprb.valid & st(T).oprb.tag(pout.tag) else st(T).oprb.val;
+            st(T).oprb.valid := st(T).oprb.tag(pout.tag) | st(T).oprb.valid;
+
+            st(T).valid := ~(st(T).issued & pout.tag = T) & st(T).valid;
+        };
+
+        # ----------------------------------------------------------------
+        # PHASE 4 -- dispatch the incoming instruction.
+        #
+        # For an ALU op: allocate station `st_choice`, capture both operands,
+        # and rename `dst` to `st_choice`.
+        #
+        # Each operand is captured with a BYPASS: the bus broadcast of phase 3
+        # and the register read of phase 4 happen in the same cycle, so if the
+        # register we are reading is reserved with exactly the tag that is on
+        # the bus right now, we take the bus value directly.  (In phase-3
+        # terms the register has already been updated, but the code reads the
+        # *pre-phase-3* ir because Ivy's parallel assignment in phase 3 wrote
+        # ir and we re-derive here; the bypass is the reason the guards
+        # mention `pout` at all.)  Without the bypass the instruction would
+        # capture the tag of a station that is retiring this very cycle and
+        # would then wait for a broadcast that never comes again -- a deadlock
+        # that the liveness proof in the companion file would catch.
+        # ----------------------------------------------------------------
+        if(~stallout) {
+            if opin = op_alu {
+
+                st(st_choice).valid := true;
+                st(st_choice).issued := false;
+
+                # operand A, with bypass
+                if(pout.valid & ir(srca).resvd & ir(srca).tag(pout.tag) ) {
+                    st(st_choice).opra.valid := true;
+                    st(st_choice).opra.tag(X) := ir(srca).tag(X);
+                    st(st_choice).opra.val := pout.val;
+                } else {
+                    st(st_choice).opra.valid := ~ir(srca).resvd;
+                    st(st_choice).opra.tag(X) := ir(srca).tag(X);
+                    st(st_choice).opra.val := ir(srca).val;
+                };
+
+                # operand B, with bypass
+                if(pout.valid & ir(srcb).resvd & ir(srcb).tag(pout.tag)){
+                    st(st_choice).oprb.valid := true;
+                    st(st_choice).oprb.tag(X) := ir(srcb).tag(X);
+                    st(st_choice).oprb.val := pout.val;
+                } else {
+                    st(st_choice).oprb.valid := ~ir(srcb).resvd;
+                    st(st_choice).oprb.tag(X) := ir(srcb).tag(X);
+                    st(st_choice).oprb.val := ir(srcb).val;
+                };
+
+                # rename the destination register to this station
+                ir(dst).resvd := true;
+                ir(dst).tag(X) := st_choice = X;
+
+                st(st_choice).dst := dst            # ghost, for the proof
+            }
+            else if opin = op_rd {
+                # The observable output.  ~stallout guarantees ~ir(srca).resvd,
+                # so [inv_reg_ready] says this is the in-order value; that is
+                # checked explicitly in phase 7.
+                dout := ir(srca).val;
+            }
+            else if opin = op_wr {
+                ir(dst).val := din;
+                ir(dst).resvd := false;             # cancels any renaming
+            }
+        };
+
+        # ----------------------------------------------------------------
+        # PHASE 5 -- issue: hand a ready station to a free execution unit.
+        #
+        # The station chosen by the arbiter fires iff it is live, both of its
+        # operands are valid, it has not already been issued, and the chosen
+        # unit is free.  Note this is the *only* place `issued` is set, and it
+        # is set at most once per tenancy of a station.
+        # ----------------------------------------------------------------
+        exe_rdy := ~eu(issue_eu).valid;
+
+        if(st(issue_choice).valid
+        & st(issue_choice).opra.valid
+        & st(issue_choice).oprb.valid
+        & ~st(issue_choice).issued
+        & exe_rdy)
+        {
+            exe_valid := true;
+            st(issue_choice).issued := true;
+        }
+        else exe_valid := false;
+
+        exe_tag  := issue_choice;
+        exe_opra := st(issue_choice).opra.val;
+        exe_oprb := st(issue_choice).oprb.val;
+
+        # ----------------------------------------------------------------
+        # PHASE 6 -- start execution.
+        #
+        # The unit latches the operands and computes.  `ready` is not written
+        # here: how long the computation takes is an oracle (section 4).
+        # ----------------------------------------------------------------
+        if(~eu(issue_eu).valid){
+            eu(issue_eu).valid := exe_valid;
+            var foo : word_t;
+            eu(issue_eu).res := foo;
+            assume f(exe_opra,exe_oprb,eu(issue_eu).res);
+            eu(issue_eu).tag(X) := exe_tag = X;
+        };
+
+        # ----------------------------------------------------------------
+        # PHASE 7 -- ghost: advance the in-order machine in lockstep,
+        # and state the refinement for the observable output.
+        # ----------------------------------------------------------------
+        if ~stallout {
+            var refdout := ref.step(opin,srca,srcb,dst,din,st_choice,issue_choice);
+
+            # [refines_read] THE OBSERVABLE REFINEMENT.  A register read that
+            # is answered (i.e. does not stall) returns exactly what the
+            # in-order machine would have returned.  This is the statement the
+            # whole invariant set exists to support; it is an `ensure`, so
+            # ivy_check discharges it as a proof obligation of the action.
+            ensure opin = op_rd -> dout = refdout
+        };
+
+        if (exe_valid) {
+            aux(issue_choice).eu := issue_eu;       # ghost
+        };
+    }
+
+
+    # ####################################################################
+    #  7.  THE INDUCTIVE INVARIANT
+    # ####################################################################
+    #
+    #  Eight conjuncts.  They are jointly inductive: `ivy_check` proves that
+    #  `after init` establishes them and that `step` preserves them, for every
+    #  choice of the nine inputs.  Read them as a description of what a tag
+    #  MEANS, going outward from the value to the architectural state.
+    #
+    #  The reader's mental model: a tag T is a promise to deliver the value
+    #  `aux(T).res`.  Each invariant says that one holder of that promise
+    #  (a register, another station's operand slot, an execution unit, the
+    #  bus) has the promise recorded correctly.
+
+    # --- (1),(2)  A captured operand is the in-order operand. ------------
+    # If a station has already latched an operand value, that value is the one
+    # the in-order machine read for this instruction.  This is what makes the
+    # ALU computation in phase 6 compute the right thing.
+    invariant [inv_opra_val]
+        st(K).valid & st(K).opra.valid -> st(K).opra.val = aux(K).opra
+    invariant [inv_oprb_val]
+        st(K).valid & st(K).oprb.valid -> st(K).oprb.val = aux(K).oprb
+
+    # --- (3)  An execution unit is a faithful carrier of its tag. --------
+    # Everything a broadcast needs to be trustworthy:
+    #   st(T).valid    the station is still there to be freed;
+    #   res = aux(T).res   the value on the bus will be the promised value;
+    #   aux(T).eu = E  the unit is the unique holder of T (this is what makes
+    #                  "one result per tag" true, and hence why freeing the
+    #                  station on a matching broadcast is correct);
+    #   st(T).issued   so that the broadcast is allowed to free the station.
+    invariant [inv_eu]
+        eu(E).valid & eu(E).tag(T)
+            -> st(T).valid & eu(E).res = aux(T).res
+               & aux(T).eu = E & st(T).issued
+
+    # --- (4)  An un-renamed register agrees with the in-order machine. ---
+    # Half of the refinement statement (section 2).
+    invariant [inv_reg_ready]
+        ~ir(R).resvd -> ir(R).val = ref.r(R)
+
+    # --- (5)  A renamed register's promise is already the in-order value. -
+    # The other half.  Note `aux(K).res = ref.r(R)`: the in-order machine has
+    # *already* executed this instruction (phase 7 runs it at dispatch), so
+    # the value it will deliver is known at renaming time.  `st(K).dst = R`
+    # makes the ownership exclusive: a live station owns exactly the register
+    # it renamed, so two registers cannot be waiting on the same tag.
+    invariant [inv_reg_reserved]
+        ir(R).resvd & ir(R).tag(K)
+            -> st(K).valid & aux(K).res = ref.r(R) & st(K).dst = R
+
+    # --- (6),(7)  A waiting operand slot points at a live producer. ------
+    # The wake-up graph is well formed: a slot waiting for T is waiting for a
+    # station that still exists and whose eventual result is exactly the
+    # operand this slot needs.  These two are the invariants that forced the
+    # relational encoding of section 3 (i).
+    invariant [inv_opra_dep]
+        st(K).valid & ~st(K).opra.valid & st(K).opra.tag(T)
+            -> st(T).valid & aux(T).res = aux(K).opra
+    invariant [inv_oprb_dep]
+        st(K).valid & ~st(K).oprb.valid & st(K).oprb.tag(T)
+            -> st(T).valid & aux(T).res = aux(K).oprb
+
+    # --- (8)  The ghost record is internally consistent. -----------------
+    # The promised result really is the ALU applied to the promised operands.
+    # This is the conjunct that connects phase 6 (which computes
+    # f(opra.val,oprb.val)) to `aux(T).res` via (1),(2).
+    invariant [inv_aux_alu]
+        st(T).valid -> f(aux(T).opra,aux(T).oprb,aux(T).res)
+
+
+    # ####################################################################
+    #  7.1  DERIVED FACTS (not needed for induction, stated because they
+    #       are the architecturally meaningful consequences)
+    # ####################################################################
+
+    # A tag is broadcast by at most one execution unit: renaming is injective
+    # on live tags, so a value can never be delivered twice.  Follows from
+    # [inv_eu] (`aux(T).eu = E`).
+    invariant [derived_unique_producer]
+        eu(E1).valid & eu(E2).valid & eu(E1).tag(T) & eu(E2).tag(T) -> E1 = E2
+
+    # A tag renames at most one architectural register.  Follows from
+    # [inv_reg_reserved] (`st(K).dst = R`).  This is the property that makes
+    # write-after-write hazards impossible.
+    invariant [derived_unique_renamed_reg]
+        ir(R1).resvd & ir(R1).tag(K) & ir(R2).resvd & ir(R2).tag(K) -> R1 = R2
+
+    # A station that is executing in a unit is still a live station: a result
+    # can never come back for a station that has already been freed and
+    # re-allocated.  Follows from [inv_eu].
+    invariant [derived_no_orphan_result]
+        eu(E).valid & eu(E).tag(T) -> st(T).valid & st(T).issued
+}
+
+export toma.step
+
+# ############################################################################
+#
+#   8.  RUNNING IT, AND CHECKING IT IS NOT VACUOUS
+#   ==============================================
+#
+#       $ ~/workplace/venv_ivy/bin/ivy_check tomasulo_documented.ivy
+#       ...
+#       OK
+#
+#   The model contains three `assume`s (the ALU relation twice, the CDB tag
+#   once).  Assumptions can only remove behaviours, so they cannot make a
+#   failed proof succeed unsoundly -- but they *can* make it vacuous by
+#   removing all behaviours.  Three experiments, all actually run:
+#
+#     * DECOY 1.  Add
+#
+#           invariant [decoy] ~(st(T).valid & st(T).issued)
+#
+#       -> `toma.decoy ... FAIL`.  Stations really are allocated and issued,
+#       so phases 4 and 5 are reachable.
+#
+#     * DECOY 2.  Add
+#
+#           invariant [decoy2] ~pout.valid
+#
+#       -> `toma.decoy2 ... FAIL`.  Results really are broadcast on the CDB,
+#       so phases 1 and 3 are reachable too.  (Both decoys fail at init as
+#       well, because `st.issued`, `eu.ready` and `pout` are unconstrained at
+#       init; the interesting failure is the second one, "must preserve the
+#       invariant".)
+#
+#     * THE `eu.tag` HOLE.  `eu(E).tag` is unconstrained at init, and phase 1
+#       reads it through `assume eu(complete_eu).tag(pout.tag)`.  If the
+#       oracle started that relation empty, every cycle with that
+#       `complete_eu` would be blocked, so the invariant would never be
+#       checked on those cycles.  `eu(E).tag(T) := true` in `after init`
+#       removes the hole for free.  (Deleting the line does *not* make either
+#       decoy stop failing -- initial values are chosen existentially when
+#       `ivy_check` searches for a counterexample, so it simply picks a
+#       non-empty relation.  The line is there to close the hole in the
+#       *inductive* argument, not to make the model reachable.)
+#
+#       The direct way to close it -- stating
+#
+#           invariant eu(E).valid -> exists T. eu(E).tag(T)
+#
+#       -- is rejected:  `error: The verification condition is not in the
+#       fragment FAU.`  This is section 3 biting again, and it is worth
+#       understanding: the existential Skolemises to a function eu_t -> tag_t,
+#       which closes a cycle with the ghost field `aux(T).eu : tag_t -> eu_t`
+#       used by [inv_eu].  Exactly the forall-exists trap that LIVENESS_GUIDE
+#       section 10.3 (7) warns about.  The `after init` assignment is the EPR
+#       way to get the same effect.
+#
+#   9.  WHAT IS NOT PROVED HERE
+#   ===========================
+#
+#   Nothing in this file says the machine ever makes progress.  It is
+#   perfectly consistent with every invariant above that `complete_eu` always
+#   names an idle unit, that `issue_choice` always names a station that is
+#   already issued, or that no execution unit is ever `ready` -- all of which
+#   are allowed because the arbiters are adversarial inputs.  Turning the
+#   model into one where "every instruction that enters a reservation station
+#   eventually retires" is a theorem requires (a) making the arbiters fair and
+#   (b) a well-founded argument over the wake-up graph of invariants (6),(7).
+#   That is `tomasulo_liveness.ivy`.
+#
+# ############################################################################
