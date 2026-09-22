@@ -455,6 +455,28 @@ invariant [shared_grant_clean]
     s.chan_snoop(C1) = grantshared
     -> s.cache(C2) ~= modified & s.cache(C2) ~= exclusive
 
+# A cache whose grant is still in flight has not installed anything yet: a BusRd
+# requester was invalid and stays invalid, a BusRdX requester was invalid or shared,
+# and while its downward channel holds the grant no snoop can reach it.
+invariant [grantee_uninstalled]
+    (s.chan_snoop(C) = grantshared | s.chan_snoop(C) = grantexclusive)
+    -> s.cache(C) = invalid
+
+invariant [grantee_uninstalled_rdx]
+    s.chan_snoop(C) = grantmodified
+    -> s.cache(C) = invalid | s.cache(C) = shared
+
+# Hence NO dirty copy exists anywhere while a grant is in flight.  `mem` is written
+# only by a cache in M (the flush in `snoop_respond`, the writeback in `evict`), so
+# `mem` cannot change between a grant being posted and the grantee installing it.
+# This is what makes it sound to have no separate memory-controller agent: the
+# grantee reads `s.mem` directly in `recv_grant_*` and is guaranteed to see the
+# value the last flush left there.
+invariant [no_dirty_while_grant_in_flight]
+    (s.chan_snoop(C1) = grantshared | s.chan_snoop(C1) = grantexclusive
+     | s.chan_snoop(C1) = grantmodified)
+    -> s.cache(C2) ~= modified
+
 # ---------------------------------------------------------------------------
 # E. THE SAFETY THEOREM
 # ---------------------------------------------------------------------------

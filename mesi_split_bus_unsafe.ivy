@@ -1,0 +1,286 @@
+#lang ivy1.8
+
+# ---------------------------------------------------------------------------
+# MESI with SEPARATE ADDRESS AND DATA BUSES  --  A DELIBERATELY UNSAFE VARIANT
+#
+# *** THIS FILE IS EXPECTED TO FAIL.  IT IS A COUNTEREXAMPLE ARTIFACT, NOT A
+# *** PROOF.  Do not read it as a broken proof attempt; the failure IS the
+# *** result.  `mesi.ivy` is the safe model.
+#
+# WHAT QUESTION IT ANSWERS
+#
+# `mesi.ivy` gives each cache ONE downward channel, `chan_snoop(C)`, carrying
+# both the address-phase snoop (snooprd/snooprdx) and the data-phase response
+# (grantshared/grantexclusive/grantmodified).  That fusion is decision 2 of
+# LIVENESS_CASE_STUDY_MESI.md §3, and the case study claims it is what
+# serialises the protocol and makes it safe.
+#
+# A real split-transaction bus does NOT work that way: the address bus and the
+# data bus are separate, independently arbitrated resources, so an address
+# broadcast to cache C may perfectly well be in flight while a data response to
+# cache C is still outstanding.  This file models exactly that -- it splits
+# `chan_snoop` into
+#
+#     chan_addr(C) : amsg     the ADDRESS bus leg   (snooprd | snooprdx)
+#     chan_data(C) : gmsg     the DATA bus leg      (grant*)
+#
+# and changes nothing else.  The single guard that used to read
+# `chan_snoop(cl) = emptyd` in `send_snoop` now reads `chan_addr(cl) = emptya`,
+# so a pending grant no longer blocks a snoop.
+#
+# THE RESULT: single-writer/multiple-reader is VIOLATED.  This is not a hand
+# argument -- `ivy_check` finds it by bounded model checking:
+#
+#     BMC with bound 14 found a counter-example...
+#
+# and the witness it produces is the 14-step trace below (cache 0 does a read
+# miss, cache 1 a write miss).  Annotations are mine; the sequence and the
+# final state are the tool's.
+#
+#   1  pr_read_miss(0)          cache 0 wants to read      -> BusRd  queued
+#   2  pr_write_miss(1)         cache 1 wants to write     -> BusRdX queued
+#   3  arbitrate                transaction 1, for cache 0 (BusRd); snoop 1
+#   4  send_snoop(1)
+#   5  snoop_respond(1)         cache 1 invalid -> acknocopy, shared line LOW
+#   6  recv_resp(1)             ctl_shared stays false
+#   7  complete_rd              nobody had a copy -> grantexclusive to cache 0
+#                               ctl_cmd := noreq, so the bus is free again
+#                               WHILE CACHE 0 HAS NOT INSTALLED THE GRANT
+#   8  arbitrate                transaction 2, for cache 1 (BusRdX); snoop 0
+#   9  send_snoop(0)            <-- ALLOWED HERE, BLOCKED IN mesi.ivy, because
+#                               chan_addr(0) is empty even though chan_data(0)
+#                               still holds cache 0's grant
+#  10  snoop_respond(0)         cache 0 is STILL invalid, so it answers
+#                               acknocopy -- "I have no copy" -- about a line
+#                               it has already been granted EXCLUSIVELY.
+#                               *** THIS IS THE BUG ***
+#  11  recv_grant_exclusive(0)  only NOW does cache 0 install it:  cache 0 := E
+#                               (the snoop raced ahead of the fill)
+#  12  recv_resp(0)             ctl_shared stays false
+#  13  complete_rdx             -> grantmodified to cache 1
+#  14  recv_grant_modified(1)   cache 1 := M
+#
+# Final state:   cache(0) = exclusive   and   cache(1) = modified
+# i.e. a writer and an exclusive reader at the same instant.  Ivy reports the
+# violated instance as _C1 = 1, _C2 = 0.
+#
+# (The same bug also yields two simultaneous E copies if step 2 is a read miss
+# rather than a write miss; the tool happened to find the E/M shape, which is
+# strictly worse.)
+#
+# So a machine with genuinely independent address and data buses needs an EXTRA
+# mechanism that this model does not have -- a snoop-pending stall, a retry
+# response, or a fill buffer consulted by the snoop logic -- to stop step 10
+# from answering on behalf of a line whose grant is still in flight.  In
+# `mesi.ivy` the single downward channel supplies that mechanism for free: the
+# snoop of step 9 simply cannot be delivered until the grant is consumed.
+#
+# The data component (`cdata`, `mem`) of `mesi.ivy` is dropped here: it is
+# irrelevant to SWMR and it makes the bounded search much cheaper.
+#
+# HOW TO RUN
+#     ivy_check mesi_split_bus_unsafe.ivy          # bounded search, expect FAIL
+# ---------------------------------------------------------------------------
+
+finite type client
+
+type cstate = { invalid , shared , exclusive , modified }
+type creq   = { noreq , busrd , busrdx }
+type amsg   = { emptya , snooprd , snooprdx }                    # ADDRESS bus leg
+type gmsg   = { emptyg , grantshared , grantexclusive , grantmodified }  # DATA bus leg
+type umsg   = { emptyu , acknocopy , ackhadcopy }                # snoop-result lines
+
+object s = {
+    var chan_req(C:client)  : creq
+    var chan_addr(C:client) : amsg      # <-- was half of chan_snoop
+    var chan_data(C:client) : gmsg      # <-- was the other half
+    var chan_resp(C:client) : umsg
+
+    var cache(C:client) : cstate
+
+    var ctl_cmd    : creq
+    var ctl_client : client
+    var ctl_shared : bool
+    var snoop_todo(C:client)  : bool
+    var snoop_await(C:client) : bool
+
+    var waiting(C:client) : bool
+}
+
+after init {
+    s.chan_req(C)    := noreq;
+    s.chan_addr(C)   := emptya;
+    s.chan_data(C)   := emptyg;
+    s.chan_resp(C)   := emptyu;
+    s.cache(C)       := invalid;
+    s.ctl_cmd        := noreq;
+    s.ctl_shared     := false;
+    s.snoop_todo(C)  := false;
+    s.snoop_await(C) := false;
+    s.waiting(C)     := false;
+}
+
+action pr_read_miss(cl:client) = {
+    require ~s.waiting(cl);
+    require s.cache(cl) = invalid;
+    require s.chan_req(cl) = noreq;
+    s.chan_req(cl) := busrd;
+    s.waiting(cl)  := true;
+}
+
+action pr_write_miss(cl:client) = {
+    require ~s.waiting(cl);
+    require s.cache(cl) = invalid;
+    require s.chan_req(cl) = noreq;
+    s.chan_req(cl) := busrdx;
+    s.waiting(cl)  := true;
+}
+
+action pr_write_upgrade(cl:client) = {
+    require ~s.waiting(cl);
+    require s.cache(cl) = shared;
+    require s.chan_req(cl) = noreq;
+    s.chan_req(cl) := busrdx;
+    s.waiting(cl)  := true;
+}
+
+action pr_write_exclusive(cl:client) = {
+    require s.cache(cl) = exclusive;
+    s.cache(cl) := modified;
+}
+
+action evict(cl:client) = {
+    require s.cache(cl) ~= invalid;
+    s.cache(cl) := invalid;
+}
+
+action arbitrate = {
+    if s.ctl_cmd = noreq {
+        if some cl:client. s.chan_req(cl) ~= noreq {
+            s.ctl_cmd        := s.chan_req(cl);
+            s.ctl_client     := cl;
+            s.chan_req(cl)   := noreq;
+            s.ctl_shared     := false;
+            s.snoop_todo(C)  := (C ~= cl);
+            s.snoop_await(C) := (C ~= cl);
+        }
+    }
+}
+
+# THE ONE CHANGED GUARD.  In mesi.ivy this reads `s.chan_snoop(cl) = emptyd`,
+# so an unconsumed grant blocks the snoop.  With a separate address bus there
+# is nothing to block it.
+action send_snoop(cl:client) = {
+    if s.ctl_cmd ~= noreq & s.snoop_todo(cl) & s.chan_addr(cl) = emptya {
+        if s.ctl_cmd = busrd {
+            s.chan_addr(cl) := snooprd;
+        } else {
+            s.chan_addr(cl) := snooprdx;
+        };
+        s.snoop_todo(cl) := false;
+    }
+}
+
+action recv_resp(cl:client) = {
+    if s.ctl_cmd ~= noreq & s.chan_resp(cl) ~= emptyu {
+        if s.chan_resp(cl) = ackhadcopy {
+            s.ctl_shared := true;
+        };
+        s.chan_resp(cl)   := emptyu;
+        s.snoop_await(cl) := false;
+    }
+}
+
+action complete_rd = {
+    if s.ctl_cmd = busrd
+       & (forall I. ~s.snoop_await(I))
+       & s.chan_data(s.ctl_client) = emptyg {
+        if s.ctl_shared {
+            s.chan_data(s.ctl_client) := grantshared;
+        } else {
+            s.chan_data(s.ctl_client) := grantexclusive;
+        };
+        s.ctl_cmd := noreq;
+    }
+}
+
+action complete_rdx = {
+    if s.ctl_cmd = busrdx
+       & (forall I. ~s.snoop_await(I))
+       & s.chan_data(s.ctl_client) = emptyg {
+        s.chan_data(s.ctl_client) := grantmodified;
+        s.ctl_cmd := noreq;
+    }
+}
+
+action snoop_respond(cl:client) = {
+    if s.chan_addr(cl) = snooprd & s.chan_resp(cl) = emptyu {
+        if s.cache(cl) = invalid {
+            s.chan_resp(cl) := acknocopy;
+        } else {
+            s.chan_resp(cl) := ackhadcopy;
+        };
+        if s.cache(cl) ~= invalid {
+            s.cache(cl) := shared;
+        };
+        s.chan_addr(cl) := emptya;
+    };
+    if s.chan_addr(cl) = snooprdx & s.chan_resp(cl) = emptyu {
+        if s.cache(cl) = invalid {
+            s.chan_resp(cl) := acknocopy;
+        } else {
+            s.chan_resp(cl) := ackhadcopy;
+        };
+        s.cache(cl)     := invalid;
+        s.chan_addr(cl) := emptya;
+    }
+}
+
+action recv_grant_shared(cl:client) = {
+    if s.chan_data(cl) = grantshared {
+        s.cache(cl)     := shared;
+        s.chan_data(cl) := emptyg;
+        s.waiting(cl)   := false;
+    }
+}
+
+action recv_grant_exclusive(cl:client) = {
+    if s.chan_data(cl) = grantexclusive {
+        s.cache(cl)     := exclusive;
+        s.chan_data(cl) := emptyg;
+        s.waiting(cl)   := false;
+    }
+}
+
+action recv_grant_modified(cl:client) = {
+    if s.chan_data(cl) = grantmodified {
+        s.cache(cl)     := modified;
+        s.chan_data(cl) := emptyg;
+        s.waiting(cl)   := false;
+    }
+}
+
+export pr_read_miss
+export pr_write_miss
+export pr_write_upgrade
+export pr_write_exclusive
+export evict
+export arbitrate
+export send_snoop
+export recv_resp
+export complete_rd
+export complete_rdx
+export snoop_respond
+export recv_grant_shared
+export recv_grant_exclusive
+export recv_grant_modified
+
+# The only property we ask about: single writer / multiple reader.
+# EXPECTED RESULT: violated.
+invariant [swmr]
+    (s.cache(C1) = modified | s.cache(C1) = exclusive) & C1 ~= C2
+    -> s.cache(C2) = invalid
+
+# Bounded search to depth 14.  EXPECTED OUTPUT:
+#     BMC with bound 14 found a counter-example...
+attribute method = bmc[14]

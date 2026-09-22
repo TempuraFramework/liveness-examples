@@ -1,0 +1,100 @@
+#lang ivy1.8
+
+# ---------------------------------------------------------------------------
+# MSI: a worked example, mechanically checked.
+#
+# This file replays, step by step, the four-phase trace narrated in
+# LIVENESS_CASE_STUDY_MSI.md §1.6 against the actual model in `msi.ivy`.
+# Its purpose is documentation: it is the "here is what the protocol
+# *does*" companion to the invariants.
+#
+# It is not a test in the usual sense -- it is a proof.  Ivy treats a
+# `require` inside a *called* action as a guarantee (a proof obligation)
+# rather than an assumption, so every `call` below re-proves that the rule
+# was actually enabled at that point, and every `ensure` is discharged by
+# the SMT solver for all values of the uninterpreted `value` type and all
+# three-element `cache` types.  If this file reports OK, the trace in the
+# case study is a genuine execution of the protocol, not a hand-wave.
+#
+#   ivy_check msi_worked_example.ivy
+#
+# The trace, in words:
+#
+#   (1) a reads a cold line          -> BusRd,   a: I -> S
+#   (2) b reads the same line        -> BusRd,   b: I -> S   (two readers)
+#   (3) a writes                     -> BusUpgr, b: S -> I,  a: S -> M
+#       a stores v1                  -> memory is now stale
+#   (4) c reads                      -> BusRd,   a: M -> S with a Flush,
+#                                                c: I -> S and it sees v1
+#
+# Phase (4) is the interesting one: it is where the write a performed in
+# phase (3), which never touched memory, becomes visible to c.
+# ---------------------------------------------------------------------------
+
+include msi
+
+action worked_example(a:cache, b:cache, c:cache, v1:value) = {
+    require a ~= b & b ~= c & a ~= c;
+    require forall C. C = a | C = b | C = c;   # exactly three caches
+    require v1 ~= last_val;             # so the store is observable
+
+    # Start from the initial state.  (`worked_example` is an exported action,
+    # so a `require` here is an assumption on the environment: it restricts
+    # the traces we are talking about to the ones that start cold.)
+    require forall C. s.st(C) = invalid & s.reqchan(C) = no_req
+                      & s.snpchan(C) = no_snoop & s.rspchan(C) = no_rsp
+                      & ~s.pending_snoop(C) & ~s.to_snoop(C) & ~s.waiting(C)
+                      & s.val(C) = last_val;
+    require s.bus_cmd = no_req & ~s.dirty & s.mem_val = last_val;
+
+    var v0 := last_val;
+
+    # ---- (1) a reads a cold line: BusRd, everybody snoops, a ends in S ----
+    call pr_read(a);
+    call bus_arbitrate(a);
+    call send_snoop(b); call snoop_respond(b); call recv_ack(b);
+    call send_snoop(c); call snoop_respond(c); call recv_ack(c);
+    call bus_complete;
+    call recv_dat_shared(a);
+    ensure s.st(a) = shared & s.val(a) = v0 & ~s.dirty & s.mem_val = v0;
+    ensure s.st(b) = invalid & s.st(c) = invalid;
+
+    # ---- (2) b reads the same line: two sharers coexist ----
+    call pr_read(b);
+    call bus_arbitrate(b);
+    call send_snoop(a); call snoop_respond(a); call recv_ack(a);
+    call send_snoop(c); call snoop_respond(c); call recv_ack(c);
+    call bus_complete;
+    call recv_dat_shared(b);
+    ensure s.st(a) = shared & s.st(b) = shared;      # multiple readers
+    ensure ~s.dirty & s.mem_val = v0;
+
+    # ---- (3) a writes: BusUpgr invalidates b, a ends in M and stores ----
+    call pr_write(a);                                 # a is in S -> busupgr
+    ensure s.reqchan(a) = busupgr;
+    call bus_arbitrate(a);
+    call send_snoop(b); call snoop_respond(b); call recv_ack(b);
+    call send_snoop(c); call snoop_respond(c); call recv_ack(c);
+    call bus_complete;
+    call recv_dat_modified(a);
+    ensure s.st(a) = modified & s.st(b) = invalid & s.st(c) = invalid;
+    # Memory still *happens* to hold v0 here -- a has write permission but has
+    # not written yet -- yet `dirty` is already true.  `dirty` means "no longer
+    # guaranteed current", not "differs from the truth".
+    ensure s.dirty & s.mem_val = v0 & s.val(a) = v0;
+    call pr_store(a, v1);
+    ensure s.val(a) = v1 & s.mem_val = v0 & s.dirty;  # memory is now stale
+
+    # ---- (4) c reads: a must Flush and downgrade; c sees the new value ----
+    call pr_read(c);
+    call bus_arbitrate(c);
+    call send_snoop(a); call snoop_respond(a); call recv_ack(a);
+    ensure s.st(a) = shared & s.mem_val = v1 & ~s.dirty;   # the Flush happened
+    call send_snoop(b); call snoop_respond(b); call recv_ack(b);
+    call bus_complete;
+    call recv_dat_shared(c);
+    ensure s.st(a) = shared & s.st(c) = shared & s.val(c) = v1;
+    ensure s.st(b) = invalid;
+}
+
+export worked_example

@@ -1,47 +1,42 @@
 #lang ivy1.8
 
 # ---------------------------------------------------------------------------
-# MESI cache coherence protocol -- LIVENESS
+# Liveness proof of the MESI cache coherence protocol
+# ---------------------------------------------------------------------------
 #
-#     "every memory access issued by a processor is eventually served"
-#
+# In this file we prove the property that for each client C,
 #       forall C. globally ( waiting(C) -> eventually ~waiting(C) )
+# Meaning that every read request for a specific address is eventually
+# served.
 #
-# The model is `mesi.ivy` (see that file for the protocol itself and for the
-# safety theorem) plus two things:
+# To prove liveness we additionally impose a weak fairness requirement
+# on every action of the safety model. In addition, we require the following
+# property:
+#  - FIFO bus arbitration: each request carry a logical timestamp and the
+#     memory controller starts a transaction for the OLDEST queued request.
+# This property helps ensure that no request is adversarially deferred
+# until infinity forever.
 #
-#   * fairness instrumentation on every rule of the protocol, and
-#   * FIFO bus arbitration: requests carry a logical timestamp and the
-#     controller starts a transaction for the OLDEST queued request.
+# An alternative approach is via a strong fairness requirement, i.e.,
+# compassion requirement. This requirement is shown in the following file:
 #
-# WHY FIFO ARBITRATION.  With an arbitrary arbiter the property is false
-# under weak fairness: the scheduler must offer `arbitrate` a turn infinitely
-# often, but the arbiter may pick some other queued client every single time,
-# and a cache that keeps requesting can keep the bus busy forever.  There are
-# two honest ways out, and this repository carries both:
-#
-#   mesi_live.ivy             pay in the MODEL     -- FIFO arbitration, and
-#                                                     then weak fairness for
-#                                                     every rule suffices
 #   mesi_live_compassion.ivy  pay in the ASSUMPTION -- arbitrary arbiter, but
 #                                                     assume compassion
 #                                                     (strong fairness) for it
-#
-# Neither implies the other.  This file is the first.
-#
-# The proof is a single lexicographic `ranking` call (Rule 10/11 of McMillan,
-# CAV'24) with twelve components and no auxiliary lemma:
+# The liveness proof here is presented in the style of a single
+# lexicographic ranking with 12 components. Each component performs the following:
 #
 #   [00]        stage 1: queued requests at least as old as _C's   (highest)
 #   [01]..[03]  stage 3: _C's grant is in flight and must be consumed
 #   [04]..[11]  stage 2: the bus transaction the controller is running (lowest)
 #
-# Two facts about the `ranking` tactic shape everything below.  First, only
-# `l2s_needed_preserved` (conservation) and `l2s_sched_stable` (scheduler
+# Two things to note here.
+#  -  only `l2s_needed_preserved` (conservation) and `l2s_sched_stable` (scheduler
 # stability) are discounted by preemption; `l2s_progress` is not, so every
 # component must reduce its own ranking whenever its scheduler is on --
 # which is why every `work_helpful` below is literally the enabling guard of
-# its rule.  Second, component suffixes are sorted as *strings*, hence two
+# its corresponding action.  
+# Second, component suffixes are sorted as *strings*, hence two
 # digits.
 #
 # The model here drops the data component (`cdata`/`mem`) of `mesi.ivy`.
@@ -55,30 +50,52 @@ include order
 # Logical timestamps ordering the queued requests.
 instance ts : unbounded_sequence
 
-# A fixed but arbitrary number of caches.  Finiteness is what makes the
-# relational rankings below finite (Rule 5), so `work_created = true` is a
-# legitimate finite bound.
+# A fixed but arbitrary number of caches, one per each processor. 
+# The `finite` keyword makes all relational rankings below finite
+# so `work_created = true` is a finite bound.
 finite type client
 
+# the state of each client-side cache
 type cstate = { invalid , shared , exclusive , modified }      # I, S, E, M
+
+# possible client requests: no request, bus-read, bus-read-exclusive 
 type creq   = { noreq , busrd , busrdx }
+
+# possible responses: empty, snoop-read, snoop-read-exclusive, grant-shared, 
+# grant-exclusive, grant-modified
 type dmsg   = { emptyd , snooprd , snooprdx ,
                 grantshared , grantexclusive , grantmodified }
+
+# possible response-ack messages
 type umsg   = { emptyu , acknocopy , ackhadcopy }
 
+# a shared global state object.
 object s = {
+    # the channel used to send client requests
     var chan_req(C:client)   : creq
+    # the channel used to send controller responses
     var chan_snoop(C:client) : dmsg
+    # the channel used to send client-ack messages
     var chan_resp(C:client)  : umsg
 
+    # global map representing state of each cache
     var cache(C:client) : cstate
 
+    # the following variables describe the currently
+    # processed request at the controller.
     var ctl_cmd    : creq
     var ctl_client : client
+
+    #`ctl_shared` is the MESI
+    #     "shared line": the OR of the snoop responses.  It is what decides
+    #     between granting E and granting S -- the defining MESI mechanism.
     var ctl_shared : bool
+
+    # list of snoop messages to be processed
     var snoop_todo(C:client)  : bool
     var snoop_await(C:client) : bool
 
+    # whether a client is waiting for a response.
     var waiting(C:client) : bool
 
     # Timestamp of C's outstanding request; the controller serves the oldest.
@@ -89,10 +106,10 @@ object s = {
 var clock : ts
 
 # ---------------------------------------------------------------------------
-# Fairness instrumentation.
+# Weak fairness instrumentation.
 #
-# Every rule of the protocol gets a boolean flag pulsed (`:= true; := false;`)
-# in one atomic step, *before* the rule's guard is tested, and the rule body
+# Every rule of the protocol toggles a boolean flag (`:= true; := false;`)
+# in one atomic step, before the rule's guard is tested, and the rule body
 # is a guarded command.  So a turn offered to a disabled rule is a stutter
 # step and `globally eventually wf_x` says only "the scheduler offers rule x
 # a turn infinitely often" -- a statement about the SCHEDULER, which is
@@ -101,19 +118,19 @@ var clock : ts
 # runs, and would make the whole property vacuous on executions where the
 # guard never holds.
 #
-# The processor-side rules deliberately get no flag: we never want to force a
-# processor to issue a request, or to force an eviction.
+# The processor-side actionss have no weak fairness requirement:
+# we never want to force a processor to issue a request, or to force an eviction.
 # ---------------------------------------------------------------------------
 
-var wf_arb        : bool                   # arbitrate
-var wf_sendsnoop(C:client)  : bool         # send_snoop
-var wf_recvresp(C:client)   : bool         # recv_resp
-var wf_complrd    : bool                   # complete_rd
-var wf_complrdx   : bool                   # complete_rdx
-var wf_snoopresp(C:client)  : bool         # snoop_respond
-var wf_recvgs(C:client)     : bool         # recv_grant_shared
-var wf_recvge(C:client)     : bool         # recv_grant_exclusive
-var wf_recvgm(C:client)     : bool         # recv_grant_modified
+var wf_arb        : bool                   # GF arbitrate
+var wf_sendsnoop(C:client)  : bool         # GF send_snoop
+var wf_recvresp(C:client)   : bool         # GF recv_resp
+var wf_complrd    : bool                   # GF complete_rd
+var wf_complrdx   : bool                   # GF complete_rdx
+var wf_snoopresp(C:client)  : bool         # GF snoop_respond
+var wf_recvgs(C:client)     : bool         # GF recv_grant_shared
+var wf_recvge(C:client)     : bool         # GF recv_grant_exclusive
+var wf_recvgm(C:client)     : bool         # GF recv_grant_modified
 
 after init {
     s.chan_req(C)    := noreq;
@@ -144,8 +161,17 @@ after init {
 # ---------------------------------------------------------------------------
 # Processor side (environment actions, no fairness)
 # ---------------------------------------------------------------------------
+# Note that a key property maintained by all the processors is that if
+# there is already a request in flight (as determined by s.waiting(C) for 
+# each C) then it cannot repeatedly issue another message. This property
+# ensures that it is sound for us to use unit-capacity channels for each
+# processor's communication with the bus.
 
-action pr_read_miss(cl:client) = {                      # PrRd on I: BusRd
+# PrRd on I ---> BusRd
+# Processor `cl` performs a read of the cache in "I" state,
+# and because the cache is invalidated, it requires sending out
+# a busrd request.
+action pr_read_miss(cl:client) = {
     require ~s.waiting(cl);
     require s.cache(cl) = invalid;
     require s.chan_req(cl) = noreq;
@@ -155,7 +181,12 @@ action pr_read_miss(cl:client) = {                      # PrRd on I: BusRd
     s.waiting(cl)  := true;
 }
 
-action pr_write_miss(cl:client) = {                     # PrWr on I: BusRdX
+# PrWr on I ---> BusRdX
+# Processor `cl` performs a write to the cache in "I" state,
+# and because the cache is invalidated, it requires sending out
+# a bus-read-exclusive request to grant us exclusive write permissions
+# to write to the cache.
+action pr_write_miss(cl:client) = {  
     require ~s.waiting(cl);
     require s.cache(cl) = invalid;
     require s.chan_req(cl) = noreq;
@@ -165,7 +196,12 @@ action pr_write_miss(cl:client) = {                     # PrWr on I: BusRdX
     s.waiting(cl)  := true;
 }
 
-action pr_write_upgrade(cl:client) = {                  # PrWr on S: BusUpgr
+# PrWr on S ---> BusUpgr
+# Processor `cl` performs a write to the cache in "Shared" state,
+# and because the cache is shared (albeit up-to-date), it requires sending
+# out a bus-upgrade request to grant us exclusive write permissions
+# to write to the cache.
+action pr_write_upgrade(cl:client) = {
     require ~s.waiting(cl);
     require s.cache(cl) = shared;
     require s.chan_req(cl) = noreq;
@@ -176,30 +212,38 @@ action pr_write_upgrade(cl:client) = {                  # PrWr on S: BusUpgr
 }
 
 # PrWr on E: the silent E -> M upgrade, with no bus transaction at all.
+# Processor `cl` performs a write to the cache in "Exclusive" state,
+# since we already exclusively own the cache, we can simply perform
+# a write to the cache without doing anything.
 action pr_write_exclusive(cl:client) = {
     require s.cache(cl) = exclusive;
     s.cache(cl) := modified;
 }
 
+# Processor `cl` decides to manually invalidate the cache from an
+# arbitrary state and set cache state to "Invalidated"
 action evict(cl:client) = {
     require s.cache(cl) ~= invalid;
     s.cache(cl) := invalid;
 }
 
 # ---------------------------------------------------------------------------
-# Bus controller
+# Bus controller-side actions
 # ---------------------------------------------------------------------------
 
-# FIFO arbitration: start a transaction for the OLDEST queued request.  This
-# is the only change to the protocol itself, and it is what replaces
-# compassion.  The rule is unparameterized, so its guard ("the bus is idle
-# and somebody is queued") can only be falsified by the rule itself -- which
-# is exactly why plain weak fairness is enough for it.
+# The bus controller faces a queue of client-side requests incoming from
+# different clients. It performs FIFO arbitration: 
+#  - start a transaction for the OLDEST queued request.  
+# 
+# The following action decides which request to handle next, in FIFO manner.
 action arbitrate = {
     wf_arb := true;
     wf_arb := false;
+    # If the bus is free to handle the next request...
     if s.ctl_cmd = noreq {
+        # And if there is a next request to handle in FIFO order...
         if some cl:client. s.chan_req(cl) ~= noreq minimizing s.reqts(cl) {
+            # Mark this request as the one we're currently handling.
             s.ctl_cmd        := s.chan_req(cl);
             s.ctl_client     := cl;
             s.chan_req(cl)   := noreq;
@@ -210,9 +254,15 @@ action arbitrate = {
     }
 }
 
+# Broadcast a snoop message for client `cl`.
 action send_snoop(cl:client) = {
     wf_sendsnoop(cl) := true;
     wf_sendsnoop(cl) := false;
+    # If we're handling a request that requires sending a snoop message 
+    # to client `cl`, do so (while maintaining the correct message type),
+    # and mark the client `cl` has having been sent (so that it is not repeatedly
+    # sent the same message). Subject to the weak fairness condition this eventually
+    # completes for finitely many clients.
     if s.ctl_cmd ~= noreq & s.snoop_todo(cl) & s.chan_snoop(cl) = emptyd {
         if s.ctl_cmd = busrd {
             s.chan_snoop(cl) := snooprd;
@@ -223,10 +273,16 @@ action send_snoop(cl:client) = {
     }
 }
 
+# Receive a snoop-ack message from a client `cl`.
 action recv_resp(cl:client) = {
     wf_recvresp(cl) := true;
     wf_recvresp(cl) := false;
+    # If we've been waiting on `cl` to reply acknowledgement to us,
+    # process it. Note that here we don't have to process messages
+    # in any order; the fact that snooping is eventually acked is
+    # purely guaranteed by weak fairness.
     if s.ctl_cmd ~= noreq & s.chan_resp(cl) ~= emptyu {
+        # 
         if s.chan_resp(cl) = ackhadcopy {
             s.ctl_shared := true;
         };
@@ -264,10 +320,19 @@ action complete_rdx = {
 # ---------------------------------------------------------------------------
 # Client side
 # ---------------------------------------------------------------------------
+# The following actions show how the client handles responses from
+# the bus. These need to be tagged with weak fairness axioms because
+# the client must periodically poll the server's response from appropriate
+# channels and ensure timely processing.
 
+# Acknowledgement of a snoop message sent from the server
 action snoop_respond(cl:client) = {
     wf_snoopresp(cl) := true;
     wf_snoopresp(cl) := false;
+    # As result of a snooprd message, sent client's own cache
+    # to be in `shared` state and acknowledge. If client had
+    # a non-invalidated copy, specifically tell this to the server via
+    # ackhadcopy (vs. acknocopy) as well.
     if s.chan_snoop(cl) = snooprd & s.chan_resp(cl) = emptyu {
         if s.cache(cl) = invalid {
             s.chan_resp(cl) := acknocopy;
@@ -279,6 +344,8 @@ action snoop_respond(cl:client) = {
         };
         s.chan_snoop(cl) := emptyd;
     };
+    # As result of a snooprdx message, we know that someone now
+    # owns exclusive access to the address, so we invalidate our own cache.
     if s.chan_snoop(cl) = snooprdx & s.chan_resp(cl) = emptyu {
         if s.cache(cl) = invalid {
             s.chan_resp(cl) := acknocopy;
@@ -290,9 +357,11 @@ action snoop_respond(cl:client) = {
     }
 }
 
+# Acknowledgement of a grant-shared message from the server
 action recv_grant_shared(cl:client) = {
     wf_recvgs(cl) := true;
     wf_recvgs(cl) := false;
+    # Set our own cache to shared status, if we can do
     if s.chan_snoop(cl) = grantshared {
         s.cache(cl)      := shared;
         s.chan_snoop(cl) := emptyd;
@@ -300,9 +369,11 @@ action recv_grant_shared(cl:client) = {
     }
 }
 
+# Acknowledgement of a grant-exclusive message from the server
 action recv_grant_exclusive(cl:client) = {
     wf_recvge(cl) := true;
     wf_recvge(cl) := false;
+    # Set our own cache to the exclusive status, if we can do
     if s.chan_snoop(cl) = grantexclusive {
         s.cache(cl)      := exclusive;
         s.chan_snoop(cl) := emptyd;
@@ -310,9 +381,11 @@ action recv_grant_exclusive(cl:client) = {
     }
 }
 
+# Acknowledgement of a grant-modified message from the server
 action recv_grant_modified(cl:client) = {
     wf_recvgm(cl) := true;
     wf_recvgm(cl) := false;
+    # Set our own cache state to modified status
     if s.chan_snoop(cl) = grantmodified {
         s.cache(cl)      := modified;
         s.chan_snoop(cl) := emptyd;
@@ -336,7 +409,7 @@ export recv_grant_exclusive
 export recv_grant_modified
 
 # ---------------------------------------------------------------------------
-# The fairness flags are only momentarily true.
+# The fairness flags used to impose the weak-fairness axioms
 # ---------------------------------------------------------------------------
 
 invariant ~wf_arb
@@ -460,7 +533,7 @@ invariant [shared_grant_clean]
     -> s.cache(C2) ~= modified & s.cache(C2) ~= exclusive
 
 # ---------------------------------------------------------------------------
-# THE COHERENCE THEOREM
+# THE COHERENCE PROPERTY
 # ---------------------------------------------------------------------------
 
 # Single writer / multiple reader: an M or E copy is the only copy.
@@ -566,8 +639,13 @@ proof {
   instantiate wfa_recvge;
   instantiate wfa_recvgm;
   tactic ranking with {
+    # here, we're interested in liveness of the unique request from 
+    # a client _C which has requested a message to the bus.
 
-    # ===== stage 1: queued requests at least as old as _C's ===============
+
+    # stage 1: queued requests at least as old as _C's
+    # these requests must be fully processed until _C's request
+    # is handled
     definition work_created[00](N:client) = true
     definition work_needed[00](N:client)  = s.chan_req(N) ~= noreq
                                             & s.reqts(N) <= s.reqts(_C)
@@ -576,7 +654,11 @@ proof {
     definition work_helpful[00](N:client) = s.ctl_cmd = noreq
                                             & s.chan_req(_C) ~= noreq
 
-    # ===== stage 3: _C's grant is in flight and must be consumed ==========
+    # stage 3: _C's grant is in flight and must be consumed.
+    # note that there are three rankings here, because there 
+    # are separate actions for receiving a grant-shared,
+    # grant-exclusive, and grant-modified replies (so three
+    # separate fairness flags).
     definition work_created[01](N:client) = true
     definition work_needed[01](N:client)  = s.waiting(_C)
     definition work_invar[01]             = s.waiting(_C)
@@ -595,9 +677,9 @@ proof {
     definition work_progress[03](N:client)= wf_recvgm(N)
     definition work_helpful[03](N:client) = N = _C & s.chan_snoop(_C) = grantmodified
 
-    # ===== stage 2: the bus transaction now running =======================
+    # stage 2: the bus is now processing some request
 
-    # [04] the controller collects one snoop response: N leaves the awaited set.
+    # [04] the controller collects one snoop response: client N leaves the awaited set.
     definition work_created[04](N:client) = true
     definition work_needed[04](N:client)  = s.snoop_await(N) & s.ctl_cmd ~= noreq
     definition work_invar[04]             = s.waiting(_C)

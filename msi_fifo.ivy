@@ -1,34 +1,29 @@
 #lang ivy1.8
 
 # ---------------------------------------------------------------------------
-# MSI cache coherence over a split-transaction snooping bus:
-# LIVENESS, with a FIFO bus arbiter, under weak fairness only.
-#
-# The model is `msi.ivy` (read that file first -- it documents the protocol
-# and carries the safety proof) plus
-#
-#   * fairness instrumentation on the seven bus-side rules,
-#   * request timestamps and a FIFO arbiter,
-#
-# and it proves
-#
-#       for every cache C:  globally ( waiting(C) -> eventually ~waiting(C) )
-#
-# i.e. every processor request -- a read miss, a write miss, or an upgrade --
-# eventually receives its data/permission and the cache installs the line.
-#
+# Liveness proof of the MSI cache coherence protocol
 # ---------------------------------------------------------------------------
-# WHY A FIFO ARBITER
 #
-# With an arbitrary arbiter the property is *false* under weak fairness.
-# `bus_arbitrate` needs an idle bus, and an adversarial scheduler can offer
-# cache C's turn only in cycles where the bus is busy with somebody else,
-# forever.  `msi_lex.ivy` proves the property for the arbitrary arbiter by
-# assuming compassion (strong fairness) for it.  Here we pay for liveness in
-# the model instead: requests carry logical timestamps and the arbiter serves
-# the oldest.  `bus_arbitrate` then becomes *unparameterized*, its guard ("the
-# bus is idle and somebody is queued") is stable, and plain weak fairness
-# suffices.  The two results are incomparable.
+# In this file we prove the property that for each client C,
+#       forall C. globally ( waiting(C) -> eventually ~waiting(C) )
+# Meaning that every read request for a specific address is eventually
+# served.
+#
+# To prove liveness we additionally impose a weak fairness requirement
+# on every action of the safety model. In addition, we require the following
+# property:
+#  - FIFO bus arbitration: each request carry a logical timestamp and the
+#     memory controller starts a transaction for the OLDEST queued request.
+# This property helps ensure that no request is adversarially deferred
+# until infinity forever.
+#
+# An alternative approach is via a strong fairness requirement, i.e.,
+# compassion requirement. This requirement is shown in the following file:
+#
+#   msi_lex.ivy  
+
+# The liveness proof here is presented in the style of a single
+# lexicographic ranking with 9 components. 
 #
 # ---------------------------------------------------------------------------
 # THE PROOF

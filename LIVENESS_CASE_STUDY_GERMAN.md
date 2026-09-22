@@ -766,11 +766,10 @@ right components, is what removes the auxiliary lemma.
    (`german_3_unbounded_channels.ivy`) has no liveness proof; it would need per-message
    timestamps and the `X <= clock` finiteness bound, and the stage decomposition would have
    to be redone over messages rather than over clients.
-5. **Mixed-sort components are untested.** Every component in every proof here is
-   `(N:client)`, including ones whose δ ignores `N` (e.g. `work_needed[09](N) =
-   homeCurrentCommand ~= empty1`). `[00]` in `_fifo.ivy` was deliberately reformulated over
-   clients rather than timestamps to avoid mixing `ts`-sorted and `client`-sorted components
-   in one `ranking` call. Whether Ivy supports mixing is unknown.
+5. ~~**Mixed-sort components are untested.**~~ **Resolved** — see §13.1. Mixing sorts across
+   components in one `ranking` call works, and so does a sorted `work_needed` with a nullary
+   `work_progress`/`work_helpful`. Every component in the three German proofs is still
+   `(N:client)`, but only because it was convenient, not because it was required.
 6. **`l2s_progress` semantics across a long gap.** The check is a postcondition
    `old(φ) ∧ old(ψ) ∧ ¬waiting_for_progress → decreased`, and `waiting_for_progress` stays
    cleared once `r` has occurred since the freeze. The exact interaction with the
@@ -825,3 +824,249 @@ right components, is what removes the auxiliary lemma.
 
 **Always finish with ablations.** Break each `work_progress`, each `work_helpful`, each
 `instantiate`, and the component ordering, and confirm each one fails (§10).
+
+
+---
+
+## 13. Addendum: what the ABP proof added
+
+After the German proofs, the same technique was applied to the alternating bit protocol
+(`abp_ranking.ivy`), the POPL'18 / FMCAD'18 benchmark that ships here as `abp.ivy`
+(unfinished — `tactic sorry`, and it does not even parse: `eventually_data_sent = true;`
+in `after init` should be `:=`) and `abp_l2s.ivy` (complete, via the raw `l2s` tactic).
+
+**Result.** One `ranking` call, eight lexicographic components, replacing `abp_l2s.ivy`'s
+~50 hand-written monitor invariants over `$l2s_s`/`$l2s_w`/`l2s_a`/`l2s_d`, its witness
+constant, and **all four temporal-prophecy formulas** `eventually globally (sender_bit = b1
+& receiver_bit = b2)`. The case analysis on the bit combinations that the prophecy was
+there to support is subsumed by the component ordering. `OK`, 910 checks, 4.5 s.
+
+Four findings that did not come up in German:
+
+### 13.1 Mixed-sort components work
+
+`work_needed[04](J:index_t)`, `work_needed[06](M:data_msg_t)`, `work_needed[07](A:ack_msg_t)`
+and four nullary components coexist in one `ranking` call. `work_progress`/`work_helpful`
+may be nullary while `work_needed` is sorted — `ivy_ranking.py:343` computes
+`wpargs = needed_args[len(helpful_args)-len(progress_args):]`, which degenerates to all of
+`needed_args` when both are empty, giving the expected
+`decreased = ∃x. old(δ(x)) ∧ ¬δ(x)`. This retires caveat §11.5.
+
+### 13.2 A compound `work_progress` creates an unrelated tableau atom
+
+`definition work_progress[06] = data_received | stale_data_dropped` fails both
+`l2s_progress[06]` and `l2s_progress_eventually[06]`, even though each disjunct is
+individually fine and `□◇data_received` is available. The tableau allocates an atom per
+*syntactic formula* (§6.1), so `◇(data_received | stale_data_dropped)` is a fresh
+proposition with no connection to `◇data_received`.
+
+**Fix:** never build a compound progress condition. Introduce one ghost relation and pulse
+it in every action that should count, then use that single symbol.
+
+### 13.3 The tableau will not lift a pointwise implication to `□◇`
+
+Having introduced `data_drained` (pulsed wherever `data_received` is, plus on a stale drop),
+the natural move is to keep the benchmark's assumption and bridge:
+
+```ivy
+invariant (globally eventually data_received) -> (globally eventually data_drained)
+```
+
+**This is not provable**, even with `invariant data_received -> data_drained` stated
+pointwise in the model *and* repeated inside the tactic block (both were tried). The local
+tableau constraints give `□p → X□p` and `X◇p → ◇p`, but nothing that pushes a pointwise
+implication through `◇`; the missing step needs the eventuality-discharge argument, which
+lives in the fair-cycle assertion rather than in the invariant.
+
+**Consequence for `abp_ranking.ivy`:** the channel fairness is stated on the drain signal,
+`(globally eventually data_sent) -> (globally eventually data_drained)`. Because
+`data_received -> data_drained` holds pointwise (checked), this is *implied by* the
+benchmark's assumption, so the theorem is strictly stronger — but the implication is
+justified on paper, not inside Ivy. The benchmark's own axioms are kept in the file as
+`explicit` and never instantiated, so they are inert and the reader can see both.
+
+### 13.4 Lossy channels break drain schedulers, and the fix is a ghost signal
+
+A drain ranking ("messages still to be flushed from the head of the FIFO") needs
+`ψ = ∃ stale message` so that the receive is guaranteed to remove one. But a `drop` can
+remove the last stale message without any receive, falsifying ψ while `work_progress` has
+not fired: `l2s_sched_stable[06] ... FAIL`. This is not a defect in the ranking — the drop
+*is* progress — it is that Rule 10 records progress only through `work_progress`.
+
+**Fix:** a ghost signal pulsed both on the receive and on a drop *that removes a stale
+message*:
+
+```ivy
+before data_msg_drop {
+    if data_msg.le(m,m) & ~(dbit(m) <-> sender_bit) {
+        stale_data_dropped := true; stale_data_dropped := false;
+        data_drained := true; data_drained := false;
+    };
+    call data_msg.drop(m);
+}
+```
+
+Guarding the pulse matters: an unguarded `data_dropped` would fire on dropping a *fresh*
+message too, and then `l2s_progress` would demand a reduction that did not happen.
+
+### 13.5 The string-sorting trap bites twice
+
+Two of the ABP ordering ablations came back `OK` and looked like the ordering was not
+load-bearing. In fact the *ablations* were wrong: renaming `[04]` to `[055]` does not demote
+it, because `'[055]' < '[05]'` — at the fourth character, `'5'` (0x35) precedes `']'`
+(0x5D). Suffixes that genuinely sort later need a letter: `'[05a]' > '[05]'`. Redone
+properly, both ablations fail as predicted (`l2s_needed_preserved[05]` and
+`l2s_needed_preserved[06]`).
+
+Moral: §6.3 applies to anything that manipulates component suffixes, including your own
+experiments. Print `sorted(suffixes)` and read it before believing an ordering ablation.
+
+### 13.6 ABP ablation table
+
+| mutation | failing checks |
+|---|---|
+| `l2s_auto5` instead of `ranking` | 9 (`l2s_needed_are_frozen[06]`, `l2s_needed_when_start[04]`, …) |
+| delivery `[04]` demoted below the round `[05]` | `l2s_needed_preserved[05]` |
+| round `[05]` demoted below the data drain `[06]` | `l2s_needed_preserved[06]` |
+| delivery `[04]` demoted below the ack drain `[07]` | `l2s_needed_preserved[05]` |
+| data tableau components `[00]`,`[01]` deleted | 10, incl. `l2s_sched_exists` |
+| `work_progress[04] := false` | 16 |
+| delivery scheduler without the "no stale data" guard | `l2s_progress[04]` |
+| drain signal not pulsed on a stale drop | `l2s_sched_stable[06]` |
+| data channel fairness not instantiated | the fairness invariant itself |
+
+Reachability probes on the ABP model (all violated, i.e. all reachable): a value is
+delivered; the sender bit flips; phase B occurs; stale data messages occur; stale acks
+occur; two data messages are in flight at once.
+
+
+---
+
+## 14. Addendum: eliminating temporal operators from the ABP ranking
+
+`abp_ranking.ivy` is a lexicographic proof, but it is not *first-order*: sixteen temporal
+operators appear inside its `ranking` block. `abp_ranking_first_order.ivy` removes all of
+them. `OK`, 4.5 s.
+
+### 14.1 Where the temporal operators came from
+
+Every one of them traces back to the two **conditional** channel-fairness assumptions
+
+```
+(globally eventually data_sent) -> (globally eventually data_received)
+```
+
+An *unconditional* `globally eventually p` hypothesis needs no temporal operator in the
+ranking at all: `instantiate` alone discharges `l2s_progress_eventually`, as
+`german_3channels_fifo.ivy` demonstrates. A *conditional* one costs two things:
+
+1. the antecedent `globally eventually data_sent` has to be case-split on the tableau
+   (`strongfair.ivy` idiom), which is components `[00]`–`[03]` and puts
+   `~(globally eventually …)` into their schedulers; and
+2. the surviving components must carry `globally eventually data_sent` in `work_helpful` to
+   reach the consequent, plus the axiom has to be restated as a temporal `invariant`
+   inside the block (§6.8).
+
+So: **temporal operators in a ranking are a symptom of conditional fairness, not of
+liveness.** Make the assumption unconditional and they vanish. Exactly the same trade as
+`german_3channels_lex.ivy` → `german_3channels_fifo.ivy`.
+
+### 14.2 The instrumentation
+
+Two changes, both in the model:
+
+**(a) Fair-lossy channels — head protection.** A message may be lost only while some older
+message is still in flight ahead of it:
+
+```ivy
+before data_msg_drop {
+    if data_msg.le(m,m) & (exists X. data_msg.le(m,X) & X ~= m) {
+        call data_msg.drop(m);
+    }
+}
+```
+
+**(b) The two receive actions become guarded commands** with turn flags pulsed *before* the
+guard (§3.2), so `globally eventually recv_data_turn` is an honest statement about the
+scheduler:
+
+```ivy
+before receiver_receive_data {
+    recv_data_turn := true;
+    recv_data_turn := false;
+    if exists X. data_msg.le(X,X) { … receive the head … }
+}
+```
+
+Note the original `data_received` could not serve as a weak-fairness flag: it is pulsed
+*before* `data_msg.receive()`, whose `assume`s prune the trace when the channel is empty —
+the vacuity trap of §3.1, inherited from the benchmark.
+
+### 14.3 Head protection does double duty
+
+It was introduced to make "the data channel is non-empty" stable (only a receive can empty
+it now — a drop needs an older message to remain). It also, for free, makes **"a stale
+message is present" stable**, which is the problem that §13.4 had to solve with a ghost
+signal:
+
+> In phase A the stale messages are exactly the FIFO's oldest ones (a safety invariant of
+> the original model). So if exactly one stale message remains, it *is* the head, and the
+> head cannot be dropped. The stale set can therefore only be emptied by a receive.
+
+So `stale_data_dropped` / `data_drained` and the whole bridging problem of §13.3 disappear.
+The findings of §13.2–13.4 remain valid for the un-instrumented model.
+
+### 14.4 The price: two new components
+
+Because the turn flag now pulses on an empty channel, a scheduler that is on while the
+channel is empty would violate `l2s_progress` (nothing is received, nothing reduces). The
+fix is to give "waiting for the next send" its own ranking — and the natural one is the
+boolean *"the channel is empty"*, reduced by the send itself:
+
+```ivy
+definition work_needed[04]   = (sender_bit <-> receiver_bit) & ~(exists M. data_msg.le(M,M))
+definition work_progress[04] = sender_scheduled
+definition work_helpful[04]  = (sender_bit <-> receiver_bit) & ~(exists M. data_msg.le(M,M))
+```
+
+It must carry the phase conjunct: without it, the ranking would also grow when the data
+channel empties during phase B, where nothing above it is scheduled.
+
+### 14.5 Result
+
+| | `abp_l2s.ivy` | `abp_ranking.ivy` | `abp_ranking_first_order.ivy` |
+|---|---|---|---|
+| tactic | `l2s` (manual) | `ranking` | `ranking` |
+| components / invariants | ~50 invariants | 8 components | **6 components** |
+| temporal prophecy | 4 formulas | none | none |
+| temporal operators in the proof | many | 16 | **0** |
+| channel fairness | conditional | conditional | **plain weak fairness** |
+| model | benchmark | benchmark | benchmark + head protection |
+
+The six components are: delivery `[00]`, the round `[01]`, drain stale data `[02]`, drain
+stale acks `[03]`, wait-for-data-send `[04]`, wait-for-ack-send `[05]`.
+
+**Caveat, same shape as `german_3channels_fifo.ivy`:** this is an *incomparable* theorem.
+The fairness assumption is weaker (unconditional), but the model is stronger (the channel
+protects its head). It is not implied by, and does not imply, the benchmark result.
+
+### 14.6 Ablations and reachability
+
+| mutation | failing checks |
+|---|---|
+| **head protection removed (unconstrained drops)** | `l2s_sched_stable[00]`,`[01]`,`[02]`,… |
+| `l2s_auto5` instead of `ranking` | `l2s_needed_are_frozen[02]`,`l2s_progress_made[01]`,… |
+| delivery `[00]` demoted below the round `[01]` | `l2s_needed_preserved[01]` |
+| round `[01]` demoted below the data drain `[02]` | `l2s_needed_preserved[02]` |
+| delivery `[00]` demoted below the ack drain `[03]` | `l2s_needed_preserved[01]`,`[03]` |
+| delivery `[00]` demoted below wait-for-send `[04]` | `l2s_needed_preserved[01]`,`[03]` |
+| `work_progress[00] := false` | `l2s_progress[00]`, … |
+| delivery scheduler without "channel non-empty" | `l2s_progress[00]` |
+| delivery scheduler without "no stale data" | `l2s_progress[00]` |
+| wait-for-send components `[04]`,`[05]` deleted | `l2s_sched_exists` |
+
+Reachability probes (all violated, i.e. all reachable) — note the first, which checks the
+instrumentation did not quietly turn the channel into a reliable one:
+
+**a message is actually lost**; a value is delivered; phase B occurs; stale data messages
+occur; stale acks occur; an empty data channel in phase A occurs.

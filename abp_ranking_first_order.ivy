@@ -1,0 +1,483 @@
+#lang ivy1.8
+
+# This file contains a liveness proof of the alternating bit protocol,
+# and illustrates Ivy's liveness to safety tactic on an infinite-state
+# system that requires both dynamic abstraction and temporal
+# prophecy. The example is discussed in the following papers:
+#
+# Oded Padon, Jochen Hoenicke, Giuliano Losa, Andreas Podelski, Mooly
+# Sagiv, and Sharon Shoham: Reducing Liveness to Safety in First-Order
+# Logic. POPL 2018: Article 26.
+#
+# Oded Padon, Jochen Hoenicke, Kenneth L. McMillan, Andreas Podelski,
+# Mooly Sagiv, Sharon Shoham: Temporal Prophecy for Proving Temporal
+# Properties of Infinite-State Systems. FMCAD 2018: 1-11
+#
+# To verify this file, run:
+#
+#     $ ivy_check alternating_bit_protocol.ivy
+#     ...
+#     OK
+#
+
+################################################################################
+#
+# A basic version of alternating bit protocol with binary (1-bit)
+# sequence number and FIFO channels.
+#
+################################################################################
+
+################################################################################
+#
+# Module for axiomatizing a totally ordered set with fixed order
+#
+# The module includes an le relation, a minimal element (zero) and
+# get_succ and get_pred actions.
+#
+# In this module, the order is arbitrary and fixed.
+#
+################################################################################
+
+module total_order(carrier) = {
+    relation le(X:carrier,Y:carrier)   # less than or equal
+
+    axiom le(X, X)                        # Reflexivity
+    axiom le(X, Y) & le(Y, Z) -> le(X, Z) # Transitivity
+    axiom le(X, Y) & le(Y, X) -> X = Y    # Anti-symmetry
+    axiom le(X, Y) | le(Y, X)             # Totality
+
+    individual zero:carrier
+    axiom le(zero, X)
+
+    action get_succ(x:carrier) returns (y:carrier) = {
+        assume le(x,y) & x ~= y & ((le(x, Z) & x ~= Z) -> le(y, Z));
+    }
+
+    action get_pred(y:carrier) returns (x:carrier) = {
+        require y ~= zero;
+        assume le(x,y) & x ~= y & ((le(x, Z) & x ~= Z) -> le(y, Z));
+    }
+}
+
+################################################################################
+#
+# Module for a fifo channel
+#
+################################################################################
+
+module fifo_channel(m_t) = {
+    relation le(X:m_t,Y:m_t)  # partial order representing messages in
+                              # the channel - larger messages are
+                              # older. le(x,x) means message x is in
+                              # the channel
+
+    invariant le(X, Y) & le(Y, Z) -> le(X, Z)  # Transitivity
+    invariant le(X, Y) & le(Y, X) -> X = Y  # Anti-symmetry
+    invariant le(X, Y) -> le(X, X) & le(Y, Y)  # Partial reflexivity
+    invariant le(X, X) & le(Y, Y) -> le(X, Y) | le(Y, X)  # Partial Totality
+
+    after init {
+        le(X, Y) := false;
+    }
+
+    action send(m: m_t) = {
+        # insert m as a newest message
+        require ~le(m, m);
+        le(m, m) := true;
+        le(m, X) := le(X,X);
+    }
+
+    action receive returns (m: m_t) = {
+        # receive the oldest message and remove it
+        assume le(m, m);
+        assume le(m,X) -> X = m;
+        le(X,m) := false;
+    }
+
+    action drop(m:m_t) = {
+        # drop a message
+        le(X,Y) := le(X, Y) & X ~= m & Y ~= m;
+    }
+}
+
+################################################################################
+#
+# The protocol itself, with tracking of events for expressing
+# fairness assumptions.
+#
+################################################################################
+
+isolate abp = {
+
+    # a totally ordered set for indices
+    type index_t
+    instantiate index : total_order(index_t)
+
+    # an uninterpreted sort for data items
+    type value
+    individual bot:value # special bottom value
+
+    # data messages (sent from sender to received), with a fifo channel,
+    # and a data item and sequence bit for every message
+    type data_msg_t
+    instantiate data_msg : fifo_channel(data_msg_t)
+    function d(D:data_msg_t): value  # immutable
+    relation dbit(D:data_msg_t)  # immutable
+
+    # ack messages (sent from receiver to sender), with a fifo channel and
+    # a sequence number bit for every message.
+    type ack_msg_t
+    instantiate ack_msg : fifo_channel(ack_msg_t)
+    relation abit(A:ack_msg_t)  # immutable
+
+    action gen_data(v:value)
+    action sender_send_data(m:data_msg_t, a:ack_msg_t)
+    action sender_receive_ack(m:data_msg_t, a:ack_msg_t)
+    action receiver_receive_data(m:data_msg_t, a:ack_msg_t)
+    action receiver_send_ack(m:data_msg_t, a:ack_msg_t)
+    action data_msg_drop(m:data_msg_t, a:ack_msg_t)
+    action ack_msg_drop(m:data_msg_t, a:ack_msg_t)
+
+    specification {
+
+        # sender array and receiver array
+        individual sender_array(I:index_t) : value
+        individual receiver_array(I:index_t) : value
+
+        # sender index and receiver index
+        individual sender_i:index_t
+        individual sender_gen_i:index_t # starts with 0 and increments one by one
+        individual receiver_i:index_t
+
+        # sender and receiver bits, initially 0 (false)
+        relation sender_bit
+        relation receiver_bit
+
+        # flags for tracking fairness assumptions
+        relation sender_scheduled
+        relation receiver_scheduled
+        relation data_sent
+        relation data_received
+        relation ack_sent
+        relation ack_received
+
+        # Turn flags for the two *receive* actions.  Unlike data_received /
+        # ack_received (which are pulsed only on a successful receive, because
+        # the assumes inside data_msg.receive prune the other traces), these are
+        # pulsed unconditionally, before the guard.  They are therefore honest
+        # weak-fairness flags: "the scheduler offered the receiver a turn".
+        relation recv_data_turn
+        relation recv_ack_turn
+
+        after init {
+            sender_array(I) := bot;
+            receiver_array(I) := bot;
+            sender_i := index.zero;
+            sender_gen_i := index.zero;
+            receiver_i := index.zero;
+            sender_bit := false;
+            receiver_bit := false;
+            sender_scheduled := false;
+            receiver_scheduled := false;
+            data_sent := false;
+            data_received := false;
+            ack_sent := false;
+            ack_received := false;
+            recv_data_turn := false;
+            recv_ack_turn := false;
+        }
+
+        ################################################################################
+        #
+        # Protocol actions
+        #
+        ################################################################################
+
+        #     action gen_data(v:value)
+        before gen_data {
+            # populate sender_gen_i entry of sender's array, and update sender_gen_i.
+            require v ~= bot;
+            sender_array(sender_gen_i) := v;
+            sender_gen_i := index.get_succ(sender_gen_i);
+        }
+
+        #    action sender_send_data(m:data_msg_t, a:ack_msg_t)
+        before sender_send_data {
+            sender_scheduled := true;
+            sender_scheduled := false;
+
+
+            if sender_array(sender_i) ~= bot { # if sender_i is populated by gen_data already
+                # m represents a message ID
+                assume d(m) = sender_array(sender_i);
+                assume dbit(m) <-> sender_bit;
+                # enter m into queue
+                call data_msg.send(m); 
+
+                data_sent := true;
+                data_sent := false;
+            } 
+        }
+
+        #    action sender_receive_ack(m:data_msg_t, a:ack_msg_t)
+        before sender_receive_ack {
+            recv_ack_turn := true;
+            recv_ack_turn := false;
+
+            if exists X. ack_msg.le(X,X) {
+            ack_received := true;
+            ack_received := false;
+
+            # receive acknowledgement
+            a := ack_msg.receive();
+            # if bit matches, then it is a valid ACK, otherwise it is a NACK
+            if abit(a) <-> sender_bit {
+                sender_bit := ~sender_bit;
+                # increment sender_i, since current one is ack'ed.
+                sender_i := index.get_succ(sender_i)
+            }
+            };
+        }
+
+        before receiver_receive_data {
+            recv_data_turn := true;
+            recv_data_turn := false;
+
+            if exists X. data_msg.le(X,X) {
+            data_received := true;
+            data_received := false;
+
+            # receive a particular message ID
+            m := data_msg.receive();
+            # if receiver bit matches message bit
+            if dbit(m) <-> receiver_bit {
+                # flip receiver bit, append to receiver array
+                receiver_bit := ~receiver_bit;
+                receiver_array(receiver_i) := d(m);
+                receiver_i := index.get_succ(receiver_i)
+            }
+            };
+        }
+
+        before receiver_send_ack {
+            receiver_scheduled := true;
+            receiver_scheduled := false;
+
+            # send ack with ~receiver_bit
+            assume abit(a) <-> ~receiver_bit;
+            call ack_msg.send(a);
+
+            ack_sent := true;
+            ack_sent := false;
+        }
+
+        # THE INSTRUMENTATION.  A fair-lossy channel: a message may be lost only
+        # while some older message is still in flight ahead of it.  Equivalently,
+        # the channel may not indefinitely discard the message at the head.
+        # This is the first-order replacement for the conditional assumption
+        # (globally eventually sent) -> (globally eventually received).
+        before data_msg_drop {
+            if data_msg.le(m,m) & (exists X. data_msg.le(m,X) & X ~= m) {
+                call data_msg.drop(m);
+            }
+        }
+
+        before ack_msg_drop {
+            if ack_msg.le(a,a) & (exists X. ack_msg.le(a,X) & X ~= a) {
+                call ack_msg.drop(a);
+            }
+        }
+
+    ################################################################################
+	#
+	# Invariants for proving safety (also help for liveness)
+	#
+	################################################################################
+
+        # safety - receiver array has values from sender array for all received indices
+        invariant receiver_array(I) ~= bot -> receiver_array(I) = sender_array(I)
+
+        # inductive invariant for proving safety
+
+        invariant index.le(sender_gen_i, I) <-> sender_array(I) = bot
+        invariant index.le(receiver_i, I) <-> receiver_array(I) = bot
+        invariant index.le(sender_i, sender_gen_i)
+
+        invariant ~sender_bit & ~receiver_bit & ack_msg.le(A,A) -> abit(A)
+        invariant ~sender_bit & ~receiver_bit & data_msg.le(M1,M2) -> ~(dbit(M1) & ~dbit(M2))
+
+        invariant sender_bit & receiver_bit & ack_msg.le(A,A) -> ~abit(A)
+        invariant sender_bit & receiver_bit & data_msg.le(M1,M2) -> ~(~dbit(M1) & dbit(M2))
+
+        invariant ~sender_bit & receiver_bit & data_msg.le(M,M) -> ~dbit(M)
+        invariant ~sender_bit & receiver_bit & ack_msg.le(A1,A2) -> ~(abit(A1) & ~abit(A2))
+
+        invariant sender_bit & ~receiver_bit & data_msg.le(M,M) -> dbit(M)
+        invariant sender_bit & ~receiver_bit & ack_msg.le(A1,A2) -> ~(~abit(A1) & abit(A2))
+
+        invariant (sender_bit <-> receiver_bit)  -> sender_i = receiver_i
+        invariant (sender_bit <-> ~receiver_bit) -> (
+            # receiver_i = sender_i + 1
+            ~index.le(receiver_i, sender_i) &
+            (forall I. ~index.le(I,sender_i) -> index.le(receiver_i,I))
+        )
+
+        invariant data_msg.le(M,M) & (dbit(M) <-> sender_bit) -> ~index.le(sender_gen_i, sender_i)
+        invariant data_msg.le(M,M) & (dbit(M) <-> sender_bit) -> d(M) = sender_array(sender_i)
+        invariant data_msg.le(M,M) -> d(M) ~= bot
+
+        invariant ack_msg.le(A,A) & (abit(A) <-> sender_bit) -> ~index.le(receiver_i,sender_i)
+        invariant ack_msg.le(A,A) & (abit(A) <-> sender_bit) -> receiver_array(sender_i) = sender_array(sender_i)
+        invariant ack_msg.le(A,A) & (abit(A) <-> sender_bit) -> receiver_array(sender_i) ~= bot
+
+        # the event flags are only transiently true
+        invariant ~sender_scheduled
+        invariant ~receiver_scheduled
+        invariant ~data_sent
+        invariant ~data_received
+        invariant ~ack_sent
+        invariant ~ack_received
+        invariant ~recv_data_turn
+        invariant ~recv_ack_turn
+
+        ################################################################################
+        #
+        # Temporal property and its proof
+        #
+        # The property to prove is:
+        # (
+        #    (globally eventually sender_scheduled) &                                 # scheduling fairness
+        #    (globally eventually receiver_scheduled) &                               # scheduling fairness
+        #    ((globally eventually data_sent) -> (globally eventually data_received)) # data channel fairness
+        #    ((globally eventually ack_sent) -> (globally eventually ack_received))   # ack channel fairness
+        # ) -> (forall I. globally (sender_array(I) ~= bot -> eventually (receiver_array(I) ~= bot)))
+        #
+        # The set A of formulas containts the following formulas (and their subformulas):
+        # 1. the property
+        # 2. eventually globally ~sender_bit & ~receiver_bit
+        # 3. eventually globally ~sender_bit &  receiver_bit
+        # 4. eventually globally  sender_bit & ~receiver_bit
+        # 5. eventually globally  sender_bit &  receiver_bit
+        #
+        # We also use "witness constants" for the following formula:
+        # ~ globally (sender_array(I) ~= bot -> eventually receiver_array(I) ~= bot)
+
+        #
+        ################################################################################
+    }
+
+
+    # ------------------------------------------------------------------------
+    # All four fairness assumptions are now plain, unconditional weak fairness:
+    # "the scheduler offers this action a turn infinitely often".  Every one of
+    # the four actions is a guarded command whose flag is pulsed before the
+    # guard, so a turn on a disabled action is a stutter step and the
+    # assumptions are satisfiable (they are assumptions about the scheduler,
+    # not about the protocol).
+    # ------------------------------------------------------------------------
+
+    explicit temporal axiom [fair_sender]    globally eventually sender_scheduled
+    explicit temporal axiom [fair_receiver]  globally eventually receiver_scheduled
+    explicit temporal axiom [fair_recv_data] globally eventually recv_data_turn
+    explicit temporal axiom [fair_recv_ack]  globally eventually recv_ack_turn
+
+    # ------------------------------------------------------------------------
+    # THE LEXICOGRAPHIC ARGUMENT -- six components, no temporal operator in any
+    # of them.  Track one index _I that has been generated but not delivered.
+    #
+    #   phase A  sender_bit  = receiver_bit    the sender is pushing data
+    #   phase B  sender_bit ~= receiver_bit    the receiver is pushing an ack
+    #
+    # In each phase the channel first has to be drained of the messages left
+    # over from the previous phase (they are the FIFO's oldest, so the receiver
+    # hits them first), then the next message through does the real work.  If
+    # the channel is empty we simply wait for the next send.
+    #
+    #   [00]  delivery    undelivered indices <= _I; reduced when the receiver
+    #                     accepts a message, which is guaranteed once no stale
+    #                     data is left and the channel is non-empty.
+    #   [01]  round       `sender_bit ~= receiver_bit`; reduced by the ack that
+    #                     opens the next round.
+    #   [02]  drain the stale data left from the previous phase.
+    #   [03]  drain the stale acks left from the previous phase.
+    #   [04]  phase A with an empty data channel: wait for the sender's turn.
+    #   [05]  phase B with an empty ack channel: wait for the receiver's turn.
+    #
+    # Ordering (each is an ablation):
+    #   * [01] grows when receiver_bit flips, which is [00]'s event  -> [00]>[01]
+    #   * [02] grows when sender_bit flips, which is [01]'s event    -> [01]>[02]
+    #   * [03] grows when receiver_bit flips                         -> [00]>[03]
+    #   * [04] grows on entering phase A ([01]'s event) and when the data
+    #     channel empties ([00]/[02]'s event)                        -> above [04]
+    #   * [05] grows on entering phase B ([00]'s event) and when the ack
+    #     channel empties ([01]/[03]'s event)                        -> above [05]
+    #
+    # Head protection is what makes the schedulers stable: "the channel is
+    # non-empty" and "a stale message is present" can now be falsified only by
+    # a receive, never by a drop, because the last remaining stale message is
+    # the FIFO's oldest and the oldest cannot be dropped.
+    # ------------------------------------------------------------------------
+
+    explicit temporal property [liveness]
+      forall I. globally (sender_array(I) ~= bot -> eventually receiver_array(I) ~= bot)
+    proof {
+      tactic skolemizenp;
+      instantiate fair_sender;
+      instantiate fair_receiver;
+      instantiate fair_recv_data;
+      instantiate fair_recv_ack;
+      tactic ranking with {
+
+    # ---- [00] delivery
+    definition work_created[00](J:index_t) = index.le(J, sender_gen_i)
+    definition work_needed[00](J:index_t)  = index.le(J,_I) & receiver_array(J) = bot
+    definition work_invar[00]     = receiver_array(_I) = bot & sender_array(_I) ~= bot
+    definition work_progress[00]  = recv_data_turn
+    definition work_helpful[00]   = (sender_bit <-> receiver_bit) & ~(exists M. data_msg.le(M,M) & ~(dbit(M) <-> sender_bit)) & (exists M. data_msg.le(M,M))
+
+    # ---- [01] the round: waiting for the ack that starts the next one
+    definition work_created[01] = true
+    definition work_needed[01]  = ~(sender_bit <-> receiver_bit)
+    definition work_invar[01]     = receiver_array(_I) = bot & sender_array(_I) ~= bot
+    definition work_progress[01]  = recv_ack_turn
+    definition work_helpful[01]   = ~(sender_bit <-> receiver_bit) & ~(exists A. ack_msg.le(A,A) & (abit(A) <-> receiver_bit)) & (exists A. ack_msg.le(A,A))
+
+    # ---- [02] drain the stale data at the head of the data channel
+    definition work_created[02](M:data_msg_t) = data_msg.le(M,M)
+    definition work_needed[02](M:data_msg_t)  = data_msg.le(M,M) & ~(dbit(M) <-> sender_bit)
+    definition work_invar[02]     = receiver_array(_I) = bot & sender_array(_I) ~= bot
+    definition work_progress[02]  = recv_data_turn
+    definition work_helpful[02]   = (sender_bit <-> receiver_bit) & (exists M. data_msg.le(M,M) & ~(dbit(M) <-> sender_bit))
+
+    # ---- [03] drain the stale acks at the head of the ack channel
+    definition work_created[03](A:ack_msg_t) = ack_msg.le(A,A)
+    definition work_needed[03](A:ack_msg_t)  = ack_msg.le(A,A) & (abit(A) <-> receiver_bit)
+    definition work_invar[03]     = receiver_array(_I) = bot & sender_array(_I) ~= bot
+    definition work_progress[03]  = recv_ack_turn
+    definition work_helpful[03]   = ~(sender_bit <-> receiver_bit) & (exists A. ack_msg.le(A,A) & (abit(A) <-> receiver_bit))
+
+    # ---- [04] phase A, data channel empty: wait for the sender to send
+    definition work_created[04] = true
+    definition work_needed[04]  = (sender_bit <-> receiver_bit) & ~(exists M. data_msg.le(M,M))
+    definition work_invar[04]     = receiver_array(_I) = bot & sender_array(_I) ~= bot
+    definition work_progress[04]  = sender_scheduled
+    definition work_helpful[04]   = (sender_bit <-> receiver_bit) & ~(exists M. data_msg.le(M,M))
+
+    # ---- [05] phase B, ack channel empty: wait for the receiver to send
+    definition work_created[05] = true
+    definition work_needed[05]  = ~(sender_bit <-> receiver_bit) & ~(exists A. ack_msg.le(A,A))
+    definition work_invar[05]     = receiver_array(_I) = bot & sender_array(_I) ~= bot
+    definition work_progress[05]  = receiver_scheduled
+    definition work_helpful[05]   = ~(sender_bit <-> receiver_bit) & ~(exists A. ack_msg.le(A,A))
+      }
+    }
+}
+
+export abp.gen_data
+export abp.sender_send_data
+export abp.sender_receive_ack
+export abp.receiver_receive_data
+export abp.receiver_send_ack
+export abp.data_msg_drop
+export abp.ack_msg_drop
+

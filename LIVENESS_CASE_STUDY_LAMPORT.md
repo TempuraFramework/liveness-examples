@@ -557,7 +557,44 @@ Each probe was added as a deliberately false invariant and confirmed **violated*
 
 ### 10.2 Parameter ablations
 
-*(see the table filled in below)*
+Each row mutates one parameter of the verifying file and re-runs `ivy_check`. The intact
+file takes **6.3 s**; a mutated one either reports a specific failed check or does not
+finish. Note the asymmetry in how the results read: a *failed check* is direct evidence
+that the premise is false, whereas a *timeout* only says the proof no longer goes through
+(Z3 diverges rather than producing a counterexample on the broken verification
+conditions). Where a timeout was uninformative, the run was repeated with
+`action=<name>` to shrink the verification condition until the check named itself.
+
+| mutation | result |
+|---|---|
+| `work_helpful[04] := true` (drop the entry guard from the scheduler) | **`l2s_progress[04] ... FAIL`** |
+| `work_needed[01]` without the `T <= _R` bound | **`l2s_needed_preserved[01] ... FAIL`** (`action=request_cs`) |
+| `work_progress[02] := false` | **`l2s_progress[02] ... FAIL`** (`action=request_cs`) |
+| `work_progress[00] := false` | does not verify (>300 s) |
+| `work_progress[01] := false` | does not verify (>300 s) |
+| `work_progress[03] := false` | does not verify (>300 s) |
+| `work_progress[04] := false` | does not verify (>300 s) |
+| `work_helpful[01] := true` | does not verify (>300 s) |
+| `work_needed[03]` without the `T <= lastrr(S,D)` bound | does not verify (>240 s; `action=request_cs` only — `exit_cs`, `recv`, `check_cs` all still pass, which localises the break to conservation of `[03]` when a new request arrives) |
+| **`l2s_auto5` instead of `ranking`** (Rule 8, i.e. no preemption) | does not verify (>240 s on `request_cs` and `exit_cs`; `check_cs` alone still passes) |
+
+The first row is the decisive one: it is the check that says the *stable scheduler* is
+real, not cosmetic — `check_cs(X)` firing only reduces `[04]` when `X` is actually
+unblocked, which is the whole reason the `blocked` flag had to be introduced (§7.2).
+The second and third confirm that the two devices the ranking is built on — bounding a
+message ranking by the tracked request's timestamp, and pointing each ranking at the
+rule that actually reduces it — are load-bearing.
+
+The `l2s_auto5` row is the one that says *lexicographic* order is what makes this work:
+under Rule 8 every ranking must be conserved by every action, and `[01]`–`[04]` all grow
+when a node with a stale clock issues a request.
+
+For the `[delivery]` lemma, run separately:
+
+| mutation | result |
+|---|---|
+| `work_progress := false` | `l2s_progress ... FAIL` (×5), `l2s_progress_eventually ... FAIL` (×5) |
+| `work_needed` without the `T1 <= _T` bound | `l2s_needed_implies_created ... FAIL` (×5), `l2s_needed_preserved ... FAIL` (×3) |
 
 ---
 
